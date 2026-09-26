@@ -1,0 +1,20 @@
+[Unit]
+Description=Isolated SDN network agent (NAT, isolation, forwarding)
+Documentation=https://pve.proxmox.com/pve-docs/chapter-pvesdn.html
+# /etc/pve (pmxcfs) holds both the shared config and the SDN running config.
+After=pve-cluster.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/isolated-net-agent run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+# Holds the DHCPv6 lease ownership history (/var/lib/isolated-net-agent).
+StateDirectory=isolated-net-agent
+# The ruleset intentionally survives a stop so guests stay isolated;
+# use "isolated-net-agent cleanup" to remove it.
+
+[Install]
+WantedBy=multi-user.target

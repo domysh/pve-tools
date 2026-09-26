@@ -1,0 +1,5 @@
+# Local helper used to relay commands to the node during the initial setup
+# of isolated-net.
+.bridge/
+__pycache__/
+*.pyc

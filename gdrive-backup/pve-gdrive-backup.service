@@ -1,0 +1,18 @@
+[Unit]
+Description=Upload Proxmox backups to Google Drive (pve-gdrive-backup)
+Documentation=https://rclone.org/drive/
+# Started by the vzdump hook at the end of a backup job, or by
+# "pve-gdrive-backup run"; it is deliberately not enabled at boot.
+After=network-online.target pve-cluster.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pve-gdrive-backup upload
+# Uploading large vzdump archives can take hours on a home uplink.
+TimeoutStartSec=infinity
+# Stay out of the way of the guests and of the next backup job.
+Nice=10
+IOSchedulingClass=idle
+# rclone keeps its cache under $HOME; Python must not buffer the log.
+Environment=HOME=/root PYTHONUNBUFFERED=1
