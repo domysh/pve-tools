@@ -95,9 +95,10 @@ cd isolated-net                          # from the repository root
 ./remote-deploy.sh root@node1 status     # subnets, agents, IPAM allocations
 ```
 
-Or directly on a node, from a copy of this directory:
+Or directly on a node, from a clone of the repository (see the main README):
 
 ```bash
+cd /root/pve-tools/isolated-net
 python3 deploy.py install
 ```
 

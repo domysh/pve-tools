@@ -53,8 +53,9 @@ cd gdrive-backup                         # from the repository root
 
 `remote-deploy.sh` forwards port 53682 over SSH, so the Google sign-in
 completes by itself when you open the printed link in your local browser.
-You can also run the wizard on the node, e.g. from the web shell, with
-`python3 pve_gdrive_backup.py setup` from a copy of this directory: at the end
+You can also run the wizard on the node, e.g. from the web shell, from a clone
+of the repository (see the main README) with
+`python3 /root/pve-tools/gdrive-backup/pve_gdrive_backup.py setup`: at the end
 of the sign-in the browser shows an error page, whose address you paste into
 the wizard.
 
@@ -132,7 +133,8 @@ Configuration: `/etc/pve-gdrive-backup.conf` (written by the wizard).
 Installed files: `/usr/local/lib/pve-gdrive-backup/`, the command
 `/usr/local/sbin/pve-gdrive-backup`, the unit
 `/etc/systemd/system/pve-gdrive-backup.service` and the notification templates
-in `/etc/pve/notification-templates/default/` (shared by the cluster).
+in `/etc/pve/notification-templates/default/` (shared by the cluster). The
+outcome of the last upload is kept in `/var/lib/pve-gdrive-backup/`.
 
 ## Restore
 

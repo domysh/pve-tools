@@ -75,6 +75,9 @@ CONFIG_PATH = Path("/etc/pve-gdrive-backup.conf")
 VZDUMP_CONF = Path("/etc/vzdump.conf")
 PENDING_FLAG = Path("/run/pve-gdrive-backup.pending")
 LOCK_PATH = Path("/run/pve-gdrive-backup.lock")
+# systemd forgets the state of the oneshot unit as soon as it is inactive.
+STATE_DIR = Path("/var/lib/pve-gdrive-backup")
+LAST_UPLOAD_PATH = STATE_DIR / "last-upload.json"
 
 # pmxcfs is shared by the whole cluster: the templates are installed once.
 TEMPLATE_SOURCE_DIR = "notification-templates"
@@ -1158,7 +1161,10 @@ def step_hook(previous: Settings | None) -> tuple[str, bool]:
     """Decide what happens to a hook script already set in /etc/vzdump.conf."""
     current = read_vzdump_option("script")
     if current == str(HOOK_PATH):
-        return (previous.previous_hook, previous.chain_previous_hook) if previous else ("", False)
+        # Forget a previous hook that was deleted in the meantime.
+        if previous and previous.previous_hook and os.access(previous.previous_hook, os.X_OK):
+            return previous.previous_hook, previous.chain_previous_hook
+        return "", False
     if not current:
         return "", False
     print(f"/etc/vzdump.conf already runs a hook script, {current}:")
@@ -1376,6 +1382,15 @@ def notify_result(settings: Settings, result: UploadResult) -> None:
         log(f"WARNING: cannot send the notification: {exc}")
 
 
+def now_iso() -> str:
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def record_upload(state: dict[str, Any]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write(LAST_UPLOAD_PATH, json.dumps(state) + "\n", 0o644)
+
+
 def cmd_upload(_args: argparse.Namespace) -> int:
     settings = Settings.load()
     with open(LOCK_PATH, "w") as lock:
@@ -1388,7 +1403,10 @@ def cmd_upload(_args: argparse.Namespace) -> int:
         failed = False
         while True:
             PENDING_FLAG.unlink(missing_ok=True)
+            started = now_iso()
+            record_upload({"started": started, "running": True})
             result = upload_once(settings)
+            record_upload({"started": started, "finished": now_iso(), "ok": result.ok, "message": result.message})
             log(("" if result.ok else "ERROR: ") + result.message)
             notify_result(settings, result)
             failed = failed or not result.ok
@@ -1419,19 +1437,20 @@ def cmd_test_notification(_args: argparse.Namespace) -> None:
     print("Test notification sent: check your notification targets (Datacenter > Notifications).")
 
 
-def service_state() -> str:
-    output = run(
-        ["systemctl", "show", SERVICE_NAME, "-p", "ActiveState", "-p", "ExecMainStartTimestamp",
-         "-p", "ExecMainExitTimestamp", "-p", "ExecMainStatus"],
-        check=False,
-    )
-    state = dict(line.partition("=")[::2] for line in output.splitlines())
-    if state.get("ActiveState") == "activating":
-        return f"uploading since {state.get('ExecMainStartTimestamp')}"
-    if not state.get("ExecMainStartTimestamp"):
-        return "never ran since boot"
-    result = "succeeded" if state.get("ExecMainStatus") == "0" else f"FAILED (exit {state.get('ExecMainStatus')})"
-    return f"{result}, {state.get('ExecMainStartTimestamp')} -> {state.get('ExecMainExitTimestamp')}"
+def describe_last_upload() -> str:
+    try:
+        state = json.loads(LAST_UPLOAD_PATH.read_text())
+    except (OSError, ValueError):
+        return "none yet"
+    started = datetime.datetime.fromisoformat(state["started"])
+    if state.get("running"):
+        # A crash or reboot mid-upload leaves "running" behind: trust systemd.
+        if run(["systemctl", "is-active", SERVICE_NAME], check=False).strip() == "activating":
+            return f"uploading since {started:%Y-%m-%d %H:%M}"
+        return f"interrupted, started {started:%Y-%m-%d %H:%M}"
+    duration = datetime.datetime.fromisoformat(state["finished"]) - started
+    outcome = "succeeded" if state.get("ok") else f"FAILED: {state.get('message', '?')}"
+    return f"{outcome}, {started:%Y-%m-%d %H:%M} ({duration})"
 
 
 def cmd_status(_args: argparse.Namespace) -> None:
@@ -1448,7 +1467,7 @@ def cmd_status(_args: argparse.Namespace) -> None:
         ("Bandwidth", settings.bwlimit or "unlimited"),
         ("vzdump hook", "installed" if hook == str(HOOK_PATH) else f"NOT INSTALLED (script: {hook or 'none'}): run setup again"),
         ("Backup jobs", ", ".join(describe_job(job) for job in jobs) or "none, only manual backups are uploaded"),
-        ("Last upload", service_state()),
+        ("Last upload", describe_last_upload()),
     ]
     if active and dump_dir.is_dir():
         local = list_local_backups(dump_dir)
@@ -1486,6 +1505,7 @@ def cmd_uninstall(args: argparse.Namespace) -> None:
     log("service, hook and program removed")
     if args.purge:
         CONFIG_PATH.unlink(missing_ok=True)
+        shutil.rmtree(STATE_DIR, ignore_errors=True)
         for template in TEMPLATE_DIR.glob(f"{TEMPLATE_NAME}-*.hbs"):
             template.unlink()
         log(f"removed {CONFIG_PATH} and the notification templates (shared by the cluster)")
