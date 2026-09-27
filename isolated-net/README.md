@@ -55,9 +55,10 @@ A guest may reach a destination only if the node would send it through a
   `srvnet`, container networks, ...);
 * static special-purpose ranges: RFC 1918, 100.64.0.0/10, link-local, ULA
   (`fc00::/7`), multicast, documentation ranges, ...;
-* for every on-link global IPv6 prefix, its enclosing `/SITE_PREFIX_LEN6`
-  (default `/48`): the rest of your ISP delegation, routed by the LAN router;
-* `EXTRA_BLOCKED` from the config.
+* for every on-link global IPv6 prefix, the enclosing prefix of length
+  `--site-prefix-len6` (default `/48`): the rest of your ISP delegation, routed
+  by the LAN router;
+* the `--extra-blocked` networks.
 
 Plus anti-spoofing (only the vnet subnets may leave the node) and TCP MSS
 clamping to the route MTU (useful with PPPoE uplinks).
@@ -86,44 +87,59 @@ inject routes into the node with rogue router advertisements.
 
 ## Deploy
 
-From your workstation (needs root SSH to one node of the cluster); the
-`./remote-deploy.sh` commands in this README run from this directory:
+As root in the shell of any node of the cluster:
 
 ```bash
-cd isolated-net                          # from the repository root
-./remote-deploy.sh root@node1            # install / reconcile
-./remote-deploy.sh root@node1 status     # subnets, agents, IPAM allocations
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/domysh/pve-tools/main/isolated-net/install.sh)"
 ```
 
-Or directly on a node, from a clone of the repository (see the main README):
+It shows the settings it is going to use (the defaults for a new network, the
+current ones for an existing network) and lets you install, change them or
+abort: nothing is touched before that. Other commands go after `--`:
 
 ```bash
-cd /root/pve-tools/isolated-net
-python3 deploy.py install
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/domysh/pve-tools/main/isolated-net/install.sh)" -- status
 ```
+
+`status` shows the subnets, the agent on every node and the IPAM allocations.
+From a clone of the repository, `./install.sh [arguments]` or
+`python3 deploy.py [arguments]` run the local copy.
 
 `install` is idempotent. It installs `dnsmasq` on every node (without ever
 starting its default instance), creates or reconciles the zone, vnet and
 subnets, stores the resolved settings in `/etc/pve/isolated-net.conf`, installs
 the agent on every online node and applies the SDN config only if something is
-pending. After adding a node to the cluster, run it again.
+pending. Run the command again after adding a node to the cluster, and to
+update the agent to the latest version.
 
 ### Configuration
 
-Edit `isolated-net.conf` before the first run:
+Every setting can be changed interactively or given as an option of
+`install`, e.g. `bash -c "$(curl -fsSL https://raw.githubusercontent.com/domysh/pve-tools/main/isolated-net/install.sh)" -- install --subnet4 10.100.0.0/22`:
 
-| Key | Default | Meaning |
+| Option | Default | Meaning |
 | --- | --- | --- |
-| `ZONE`, `VNET` | `isolated`, `isonet` | SDN ids (max 8 chars) |
-| `SUBNET4` | `auto` | first free `/22` from `10.100.0.0` |
-| `SUBNET6` | `auto` | random RFC 4193 ULA `/48`, subnet 1 as `/64` |
-| `DNS4`, `DNS6` | empty | empty = the gateway (dnsmasq forwards to the node's resolvers) |
-| `SITE_PREFIX_LEN6` | `48` | enclosing prefix blocked around on-link global IPv6 networks |
-| `EXTRA_BLOCKED` | empty | more CIDRs to block |
+| `--zone`, `--vnet` | `isolated`, `isonet` | SDN ids (2-8 lowercase letters and digits) |
+| `--subnet4` | `auto` | first free `/22` from `10.100.0.0` (`--subnet4-auto-prefix-len` sets the size) |
+| `--subnet6` | `auto` | random RFC 4193 ULA `/48`, subnet 1 as `/64` |
+| `--dns4`, `--dns6` | empty | empty = the gateway (dnsmasq forwards to the node's resolvers) |
+| `--site-prefix-len6` | `48` | enclosing prefix blocked around on-link global IPv6 networks, `0` disables it |
+| `--extra-blocked` | empty | more CIDRs to block, comma separated |
+| `--vnet-alias` | `Isolated NAT network (internet only)` | vnet description in the web UI |
 
-`auto` subnets are chosen once. Afterwards the SDN config is the source of
-truth and `/etc/pve/isolated-net.conf` records the resolved values: copy them
-into `isolated-net.conf` to recreate the identical network elsewhere.
+With `-y` nothing is asked: the options, then the current network, then the
+defaults decide, so `install -y` alone updates an existing network without
+changing it. `--config <file>` reads the same settings from a file of
+`KEY=VALUE` lines, `KEY` being the option name in upper case with underscores (see
+[isolated-net.conf](isolated-net.conf)); options win over it.
+
+Zone, vnet and subnets are chosen once: an existing network keeps them and
+`install` refuses different values (`uninstall --purge` first to rebuild it).
+The DNS servers and the vnet alias only apply when the network is created;
+change them later in Datacenter > SDN. The site prefix and the extra blocked
+networks can change at any time. `auto` subnets are resolved once, and
+`/etc/pve/isolated-net.conf` records the values: pass them with `--subnet4` and
+`--subnet6` to recreate the identical network elsewhere.
 
 ## Using the network
 
@@ -140,7 +156,7 @@ pct set <vmid> --net1 name=eth1,bridge=isonet,ip=dhcp,ip6=dhcp
 ```
 
 Inside the guest just use DHCP (IPv4) and DHCPv6 + RA (IPv6). To see or pin
-allocations: Datacenter > SDN > IPAM, or `./remote-deploy.sh root@node1 status`.
+allocations: Datacenter > SDN > IPAM, or the `status` command.
 
 **LXC and DNS:** containers without an explicit `nameserver` inherit the
 node's `/etc/resolv.conf`, which usually points at something the network
@@ -166,11 +182,12 @@ systemctl reload isolated-net-agent     # force a resync
 Uninstall:
 
 ```bash
-./remote-deploy.sh root@node1 uninstall            # agent only: the vnet stays, without NAT/isolation
-./remote-deploy.sh root@node1 uninstall --purge    # also subnets, vnet, zone
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/domysh/pve-tools/main/isolated-net/install.sh)" -- uninstall            # agent only: the vnet stays, without NAT/isolation
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/domysh/pve-tools/main/isolated-net/install.sh)" -- uninstall --purge    # also subnets, vnet, zone
 ```
 
-`--purge` refuses to run while a guest still uses the vnet.
+Both ask for confirmation (`-y` skips it). `--purge` refuses to run while a
+guest still uses the vnet.
 
 ## Notes and limits
 

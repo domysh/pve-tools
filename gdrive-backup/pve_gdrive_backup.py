@@ -19,15 +19,17 @@ How it works
 ``setup`` is an interactive wizard: it installs rclone, connects a Google
 account (guiding you through creating your own OAuth client), asks for the
 storage, the Drive folder and the upload options, and installs everything.
-Re-run it at any time to change the configuration.
+Re-run it at any time to change the configuration. Every question also has a
+command line option, which skips it; with -y nothing is asked and the rest
+comes from the current configuration or the defaults.
 
 Usage (as root on the node that holds the backups)::
 
-    pve-gdrive-backup setup                 # wizard: install or reconfigure
+    pve-gdrive-backup setup [-y] [options]  # wizard: install or reconfigure
     pve-gdrive-backup status                # configuration, last upload, drift
     pve-gdrive-backup run                   # upload now, in the background
     pve-gdrive-backup test-notification
-    pve-gdrive-backup uninstall [--purge]
+    pve-gdrive-backup uninstall [-y] [--purge]
 """
 
 from __future__ import annotations
@@ -51,6 +53,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -88,8 +91,8 @@ CRYPT_REMOTE = "pve-gdrive-backup-crypt"
 REMOTE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 
 # Google OAuth for installed apps: loopback redirect plus PKCE. The redirect
-# reaches this script directly through `ssh -L` (remote-deploy.sh), otherwise
-# the user pastes the address the browser failed to open.
+# reaches this script directly through `ssh -L 53682:127.0.0.1:53682`,
+# otherwise the user pastes the address the browser failed to open.
 OAUTH_PORT = 53682
 OAUTH_REDIRECT_URI = f"http://127.0.0.1:{OAUTH_PORT}/"
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -659,8 +662,8 @@ def authorize(client: OAuthClient, scope: str) -> dict[str, Any]:
           "Advanced" and then "Go to <app name> (unsafe)".
         * If Google shows a checkbox for Drive access, tick it.
         * At the end the browser is sent to {OAUTH_REDIRECT_URI}:
-          - through ./remote-deploy.sh (SSH port forwarding) this completes
-            by itself;
+          - if you are connected with ssh -L {OAUTH_PORT}:127.0.0.1:{OAUTH_PORT}
+            this completes by itself;
           - otherwise the page fails to load: copy the whole address from the
             browser's address bar and paste it here.
         """
@@ -714,6 +717,11 @@ def describe_account(access_token: str) -> str:
 
 BOLD, RESET = ("\033[1m", "\033[0m") if sys.stdout.isatty() else ("", "")
 
+# False with -y: every answer comes from the options or the defaults. The
+# helpers below take the value of the matching option as `given` and do not
+# ask when it is set.
+INTERACTIVE = True
+
 
 def heading(text: str) -> None:
     print(f"\n{BOLD}== {text}{RESET}\n")
@@ -723,8 +731,21 @@ def paragraph(text: str) -> None:
     print(textwrap.dedent(text).strip("\n") + "\n")
 
 
-def ask(prompt: str, default: str = "", validate: Callable[[str], str | None] | None = None) -> str:
+def ask(
+    prompt: str,
+    default: str = "",
+    validate: Callable[[str], str | None] | None = None,
+    given: str | None = None,
+    option: str = "",
+) -> str:
     """Ask for a value; validate returns an error message or None."""
+    if given is not None or not INTERACTIVE:
+        value = default if given is None else given
+        error = validate(value) if validate else None
+        if error is not None:
+            raise ToolError(f"{option} {value!r}: {error}" if given is not None else f"{prompt}: {error}, use {option}")
+        print(f"{prompt}: {value}")
+        return value
     while True:
         suffix = f" [{default}]" if default else ""
         value = input(f"{prompt}{suffix}: ").strip() or default
@@ -734,7 +755,11 @@ def ask(prompt: str, default: str = "", validate: Callable[[str], str | None] | 
         print(f"  {error}")
 
 
-def ask_yes_no(prompt: str, default: bool) -> bool:
+def ask_yes_no(prompt: str, default: bool, given: bool | None = None) -> bool:
+    if given is not None or not INTERACTIVE:
+        value = default if given is None else given
+        print(f"{prompt} {'yes' if value else 'no'}")
+        return value
     hint = "Y/n" if default else "y/N"
     while True:
         answer = input(f"{prompt} [{hint}]: ").strip().lower()
@@ -747,10 +772,14 @@ def ask_yes_no(prompt: str, default: bool) -> bool:
         print("  answer y or n")
 
 
-def choose(prompt: str, options: Sequence[str], default: int = 0) -> int:
+def choose(prompt: str, options: Sequence[str], default: int = 0, given: int | None = None) -> int:
     """Pick one of the options; returns its 0-based index."""
     for number, label in enumerate(options, start=1):
         print(f"  {number}) {label}")
+    if given is not None or not INTERACTIVE:
+        index = default if given is None else given
+        print(f"{prompt}: {index + 1}")
+        return index
     while True:
         answer = input(f"{prompt} [{default + 1}]: ").strip() or str(default + 1)
         if answer.isdigit() and 1 <= int(answer) <= len(options):
@@ -796,7 +825,7 @@ def step_prerequisites() -> None:
     print(f"\nrclone: {run(['rclone', 'version']).splitlines()[0]}")
 
 
-def step_storage(previous: Settings | None) -> BackupStorage:
+def step_storage(previous: Settings | None, storage_option: str | None) -> BackupStorage:
     heading(f"Step 2/{STEPS} - Backup storage to upload")
     storages = backup_storages()
     usable = [storage for storage in storages if storage.path]
@@ -825,10 +854,14 @@ def step_storage(previous: Settings | None) -> BackupStorage:
     ids = [storage.storage_id for storage in usable]
     if previous and previous.storage in ids:
         default = ids.index(previous.storage)
+    elif len(ids) > 1 and not INTERACTIVE and storage_option is None:
+        raise ToolError(f"this node has several backup storages: choose one with --storage ({', '.join(ids)})")
     else:
         default = next((index for index, storage_id in enumerate(ids) if jobs_by_storage[storage_id]), 0)
+    if storage_option is not None and storage_option not in ids:
+        raise ToolError(f"--storage {storage_option}: not a directory backup storage of this node ({', '.join(ids)})")
     print("Backup storages on this node:")
-    storage = usable[choose("Storage", labels, default)]
+    storage = usable[choose("Storage", labels, default, ids.index(storage_option) if storage_option else None)]
 
     if not storage.active:
         print(f"\n  WARNING: {storage.storage_id} is not active right now; uploads fail until it is.")
@@ -852,7 +885,43 @@ def step_storage(previous: Settings | None) -> BackupStorage:
     return storage
 
 
-def ask_oauth_client(parser: configparser.ConfigParser) -> OAuthClient:
+def oauth_client_option(opts: argparse.Namespace) -> OAuthClient | None:
+    """The OAuth client given with --client-id and --client-secret, if any."""
+    if opts.client_id is None and opts.client_secret is None:
+        return None
+    if not (opts.client_id and opts.client_secret):
+        raise ToolError("--client-id and --client-secret go together")
+    if not opts.client_id.endswith(".apps.googleusercontent.com"):
+        raise ToolError("--client-id: a client ID ends with .apps.googleusercontent.com")
+    return OAuthClient(opts.client_id, opts.client_secret)
+
+
+def authorize_command(client: OAuthClient | None, scope: str) -> str:
+    """The rclone command that signs in on a computer with a browser and prints a token."""
+    options = {"client_id": client.client_id, "client_secret": client.client_secret} if client else {}
+    options["scope"] = scope
+    # rclone only accepts unpadded URL-safe base64 here.
+    blob = base64.urlsafe_b64encode(json.dumps(options, separators=(",", ":")).encode()).rstrip(b"=").decode()
+    return f'rclone authorize "drive" "{blob}"'
+
+
+def token_hint(opts: argparse.Namespace) -> str:
+    """How to connect a Google account with --token, without a browser on this node."""
+    client = oauth_client_option(opts)
+    hint = (
+        "sign in on a computer with a browser and rclone with\n"
+        f"  {authorize_command(client, opts.scope or 'drive.file')}\n"
+        "and pass the token it prints with --token"
+    )
+    if client is None:
+        return hint + " (add --client-id and --client-secret to get the command for your own OAuth client)"
+    return hint + ", --client-id and --client-secret"
+
+
+def ask_oauth_client(parser: configparser.ConfigParser, opts: argparse.Namespace) -> OAuthClient:
+    client = oauth_client_option(opts)
+    if client is not None:
+        return client
     clients: dict[str, tuple[str, str]] = {}
     for name in drive_remotes(parser):
         client_id = parser.get(name, "client_id", fallback="")
@@ -905,7 +974,7 @@ def ask_oauth_client(parser: configparser.ConfigParser) -> OAuthClient:
     return OAuthClient(client_id, client_secret)
 
 
-def ask_scope() -> str:
+def ask_scope(given: str | None) -> str:
     print("How much of your Drive may this node access?")
     options = [
         "drive.file (recommended): only the files and folders this tool creates. A\n"
@@ -914,7 +983,8 @@ def ask_scope() -> str:
         "drive: your whole Drive. Only needed to upload into a folder that already\n"
         "     exists and was not created with this OAuth client.",
     ]
-    return ("drive.file", "drive")[choose("Access", options)]
+    scopes = ("drive.file", "drive")
+    return scopes[choose("Access", options, 0, scopes.index(given) if given else None)]
 
 
 def verify_drive_remote(rclone_config: Path, name: str) -> bool:
@@ -927,25 +997,27 @@ def verify_drive_remote(rclone_config: Path, name: str) -> bool:
     return True
 
 
-def connect_new_remote(rclone_config: Path, parser: configparser.ConfigParser) -> str:
-    client = ask_oauth_client(parser)
+def validate_remote_name(value: str) -> str | None:
+    if not REMOTE_NAME_PATTERN.match(value):
+        return "use letters, digits, '_', '-' and '.'"
+    if value == CRYPT_REMOTE:
+        return f"{CRYPT_REMOTE} is reserved for the encryption layer"
+    return None
+
+
+def connect_new_remote(rclone_config: Path, parser: configparser.ConfigParser, opts: argparse.Namespace) -> str:
+    if opts.remote is not None and validate_remote_name(opts.remote):
+        raise ToolError(f"--remote {opts.remote}: {validate_remote_name(opts.remote)}")
+    client = ask_oauth_client(parser, opts)
     print()
-    scope = ask_scope()
+    scope = ask_scope(opts.scope)
     response = authorize(client, scope)
     print(f"\n  Connected to Google Drive as {describe_account(response['access_token'])}.\n")
 
     existing = set(parser.sections())
     default = next(name for name in ["gdrive"] + [f"gdrive{n}" for n in itertools.count(2)] if name not in existing)
-
-    def validate(value: str) -> str | None:
-        if not REMOTE_NAME_PATTERN.match(value):
-            return "use letters, digits, '_', '-' and '.'"
-        if value == CRYPT_REMOTE:
-            return f"{CRYPT_REMOTE} is reserved for the encryption layer"
-        return None
-
     while True:
-        name = ask("Name of the new rclone remote", default, validate)
+        name = ask("Name of the new rclone remote", default, validate_remote_name, opts.remote, "--remote")
         if name not in existing or ask_yes_no(f"  Remote '{name}' exists: replace it?", False):
             break
     write_rclone_remote(
@@ -981,26 +1053,74 @@ def reauthorize_remote(rclone_config: Path, parser: configparser.ConfigParser, n
         raise ToolError(f"remote '{name}' still does not work")
 
 
-def step_google_account(previous: Settings | None) -> tuple[Path, str]:
+def remote_from_token(rclone_config: Path, parser: configparser.ConfigParser, name: str, opts: argparse.Namespace) -> str:
+    """Create or update a remote with a token from `rclone authorize`: no browser needed here."""
+    if validate_remote_name(name):
+        raise ToolError(f"--remote {name}: {validate_remote_name(name)}")
+    try:
+        token = json.loads(opts.token)
+    except ValueError:
+        token = None
+    if not isinstance(token, dict) or not token.get("refresh_token"):
+        raise ToolError("--token: pass the whole token printed by rclone authorize, {...} included")
+    values = dict(parser[name]) if parser.has_section(name) else {"team_drive": ""}
+    client = oauth_client_option(opts)
+    if client is not None:
+        values.update(client_id=client.client_id, client_secret=client.client_secret)
+    elif not values.get("client_id"):
+        print("  No --client-id: the remote uses rclone's shared OAuth client, which is heavily rate limited.")
+    values.update(
+        type="drive",
+        scope=opts.scope or values.get("scope") or "drive.file",
+        token=json.dumps(token, separators=(",", ":")),
+    )
+    # Try the token on its own first: a wrong one must not break a working remote.
+    with tempfile.TemporaryDirectory() as trial_dir:
+        trial = Path(trial_dir) / "rclone.conf"
+        write_rclone_remote(trial, name, values)
+        if not verify_drive_remote(trial, name):
+            raise ToolError(f"--token does not work for remote '{name}' (was it made with the same OAuth client?)")
+    write_rclone_remote(rclone_config, name, values)
+    print(f"  Saved remote '{name}' in {rclone_config}.")
+    return name
+
+
+def step_google_account(previous: Settings | None, opts: argparse.Namespace) -> tuple[Path, str]:
     heading(f"Step 3/{STEPS} - Google account")
     rclone_config = Path(previous.rclone_config) if previous else default_rclone_config_path()
     parser = read_rclone_config(rclone_config)
     remotes = drive_remotes(parser)
-    if not remotes:
-        print(f"No Google Drive remote in {rclone_config} yet: let's connect your account.\n")
-        return rclone_config, connect_new_remote(rclone_config, parser)
+    wanted = opts.remote
+    if wanted is not None and parser.has_section(wanted) and wanted not in remotes:
+        raise ToolError(f"--remote {wanted}: that rclone remote is not a Google Drive remote")
+    if opts.token is not None:
+        name = wanted or (previous.drive_remote if previous else "gdrive")
+        return rclone_config, remote_from_token(rclone_config, parser, name, opts)
+    usable = wanted in remotes if wanted is not None else bool(previous and previous.drive_remote in remotes)
+    if not INTERACTIVE and not usable:
+        if wanted is not None:
+            problem = f"--remote {wanted}: no such remote in {rclone_config}"
+        else:
+            problem = "choose the Google account with --remote" + (f" ({', '.join(remotes)})" if remotes else "")
+        raise ToolError(f"{problem}. To connect an account without a browser on this node, {token_hint(opts)}")
+    if not remotes or (wanted is not None and wanted not in remotes):
+        remote = "" if wanted is None else f"'{wanted}' "
+        print(f"No Google Drive remote {remote}in {rclone_config} yet: let's connect your account.\n")
+        return rclone_config, connect_new_remote(rclone_config, parser, opts)
 
     print(f"Google Drive remotes in {rclone_config}:")
     options = [f"use '{name}' ({describe_drive_remote(parser[name])})" for name in remotes]
     options.append("connect a Google account as a new remote")
     default = remotes.index(previous.drive_remote) if previous and previous.drive_remote in remotes else 0
-    choice = choose("Remote", options, default)
+    choice = choose("Remote", options, default, remotes.index(wanted) if wanted is not None else None)
     if choice == len(remotes):
         print()
-        return rclone_config, connect_new_remote(rclone_config, parser)
+        return rclone_config, connect_new_remote(rclone_config, parser, opts)
 
     name = remotes[choice]
     if not verify_drive_remote(rclone_config, name):
+        if not INTERACTIVE:
+            raise ToolError(f"remote '{name}' does not work: sign in again with the setup without -y, or with --token")
         if not ask_yes_no(f"Sign in again for '{name}' (keeps its OAuth client and scope)?", True):
             raise ToolError(f"remote '{name}' does not work")
         reauthorize_remote(rclone_config, parser, name)
@@ -1024,7 +1144,9 @@ def validate_folder(value: str) -> str | None:
     return None
 
 
-def step_destination(previous: Settings | None, rclone_config: Path, remote: str, node: str) -> Destination:
+def step_destination(
+    previous: Settings | None, rclone_config: Path, remote: str, node: str, opts: argparse.Namespace
+) -> Destination:
     heading(f"Step 4/{STEPS} - Folder on Google Drive and encryption")
     parser = read_rclone_config(rclone_config)
     crypt = parser[CRYPT_REMOTE] if parser.has_section(CRYPT_REMOTE) else None
@@ -1037,7 +1159,7 @@ def step_destination(previous: Settings | None, rclone_config: Path, remote: str
     default_folder = previous.folder if previous and previous.drive_remote == remote else f"Backups/Proxmox/{node}"
 
     while True:
-        folder = ask("Folder on Google Drive", default_folder, validate_folder).strip("/")
+        folder = ask("Folder on Google Drive", default_folder, validate_folder, opts.folder, "--folder").strip("/")
         files = list_remote_files(str(rclone_config), f"{remote}:{folder}/dump")
         plain = [entry for entry in files or [] if is_backup_name(entry["Name"]) and not entry["Name"].endswith(".bin")]
         encrypted = [entry for entry in files or [] if entry["Name"].endswith(".bin")]
@@ -1049,11 +1171,14 @@ def step_destination(previous: Settings | None, rclone_config: Path, remote: str
             print("  Files that are already there are not uploaded again.")
         crypt_matches = crypt is not None and crypt.get("remote", "") == f"{remote}:{folder}"
         if encrypted and not crypt_matches:
-            print(
-                f"\n  The encrypted backups there were not made with the crypt remote {CRYPT_REMOTE}"
+            problem = (
+                f"The encrypted backups there were not made with the crypt remote {CRYPT_REMOTE}"
                 f" of {rclone_config}: without their passwords they would look up to date but"
                 " be unreadable. Choose another folder, or restore the old crypt remote first."
             )
+            if opts.folder is not None or not INTERACTIVE:
+                raise ToolError(f"{folder}/dump: {problem}")
+            print(f"\n  {problem}")
             continue
         break
 
@@ -1068,9 +1193,11 @@ def step_destination(previous: Settings | None, rclone_config: Path, remote: str
     )
     if previous and previous.drive_remote == remote and previous.folder == folder:
         default_encrypt = previous.encrypt
+    elif not INTERACTIVE and opts.encrypt is None:
+        raise ToolError("choose --encrypt or --no-encrypt for this folder")
     else:
         default_encrypt = bool(encrypted) or not plain
-    encrypt = ask_yes_no("Encrypt the backups?", default_encrypt)
+    encrypt = ask_yes_no("Encrypt the backups?", default_encrypt, opts.encrypt)
     if encrypt and plain:
         print(f"  The {len(plain)} unencrypted backups on Drive will be uploaded again, encrypted.")
     if not encrypt and encrypted:
@@ -1107,9 +1234,10 @@ def validate_bwlimit(value: str) -> str | None:
     return None if result.returncode == 0 else "rclone does not accept this limit (see https://rclone.org/docs/#bwlimit-bandwidth-spec)"
 
 
-def step_upload_options(previous: Settings | None) -> Settings:
+def step_upload_options(previous: Settings | None, opts: argparse.Namespace) -> Settings:
     heading(f"Step 5/{STEPS} - Upload behaviour")
     defaults = previous or Settings()
+    modes = ("mirror", "copy")
     print("When the backup job prunes an old backup:")
     mirror = choose(
         "Mode",
@@ -1117,9 +1245,10 @@ def step_upload_options(previous: Settings | None) -> Settings:
             "mirror (recommended): delete it from Drive too, Drive keeps the same backups",
             "copy: keep it on Drive, which then grows until you clean it up yourself",
         ],
-        0 if defaults.mode == "mirror" else 1,
+        modes.index(defaults.mode),
+        modes.index(opts.mode) if opts.mode else None,
     ) == 0
-    use_trash = defaults.use_trash
+    use_trash = defaults.use_trash if opts.trash is None else opts.trash
     if mirror:
         print("\nBackups deleted from Drive:")
         use_trash = choose(
@@ -1128,7 +1257,8 @@ def step_upload_options(previous: Settings | None) -> Settings:
                 "go to the Drive trash: recoverable for 30 days, but they use your quota until then",
                 "are deleted permanently: the space is freed immediately",
             ],
-            0 if defaults.use_trash else 1,
+            0 if use_trash else 1,
+            None if opts.trash is None else 0 if opts.trash else 1,
         ) == 0
 
     print()
@@ -1136,6 +1266,8 @@ def step_upload_options(previous: Settings | None) -> Settings:
         "Upload bandwidth limit, e.g. 30M (MiB/s) or a timetable like '08:00,5M 23:00,off' (empty: unlimited)",
         defaults.bwlimit,
         validate_bwlimit,
+        opts.bwlimit,
+        "--bwlimit",
     )
 
     print()
@@ -1145,8 +1277,8 @@ def step_upload_options(previous: Settings | None) -> Settings:
         Notifications), to the same targets as your backup jobs: email, webhooks...
         """
     )
-    notify_failure = ask_yes_no("Notify when an upload fails?", defaults.notify_failure)
-    notify_success = ask_yes_no("Notify also when an upload succeeds?", defaults.notify_success)
+    notify_failure = ask_yes_no("Notify when an upload fails?", defaults.notify_failure, opts.notify_failure)
+    notify_success = ask_yes_no("Notify also when an upload succeeds?", defaults.notify_success, opts.notify_success)
     return replace(
         defaults,
         mode="mirror" if mirror else "copy",
@@ -1157,7 +1289,7 @@ def step_upload_options(previous: Settings | None) -> Settings:
     )
 
 
-def step_hook(previous: Settings | None) -> tuple[str, bool]:
+def step_hook(previous: Settings | None, existing_hook: str | None) -> tuple[str, bool]:
     """Decide what happens to a hook script already set in /etc/vzdump.conf."""
     current = read_vzdump_option("script")
     if current == str(HOOK_PATH):
@@ -1169,6 +1301,11 @@ def step_hook(previous: Settings | None) -> tuple[str, bool]:
         return "", False
     print(f"/etc/vzdump.conf already runs a hook script, {current}:")
     show_file_head(Path(current))
+    if existing_hook is None and not INTERACTIVE:
+        raise ToolError(
+            f"/etc/vzdump.conf already runs the hook script {current}: add --existing-hook replace"
+            " (it stops running) or --existing-hook chain (it runs after this tool's hook)"
+        )
     choice = choose(
         "What should happen to it",
         [
@@ -1176,6 +1313,8 @@ def step_hook(previous: Settings | None) -> tuple[str, bool]:
             "keep it: it runs after this tool's hook, with the same arguments",
             "abort the setup",
         ],
+        0,
+        ("replace", "chain").index(existing_hook) if existing_hook else None,
     )
     if choice == 2:
         raise ToolError("aborted, nothing installed")
@@ -1233,28 +1372,41 @@ def show_new_passwords(passwords: tuple[str, str], settings: Settings) -> None:
         two passwords ("Yes, type in my own password").
         """
     )
-    while input('Type "saved" once you have stored them: ').strip().lower() != "saved":
+    while INTERACTIVE and input('Type "saved" once you have stored them: ').strip().lower() != "saved":
         pass
 
 
-def cmd_setup(_args: argparse.Namespace) -> None:
+def cmd_setup(args: argparse.Namespace) -> None:
     previous = load_previous_settings()
     node = local_node_name()
     action = "Changing the existing configuration" if previous else "First-time setup"
+    if INTERACTIVE:
+        action += ": nothing is installed before the final confirmation, Ctrl+C aborts"
+    else:
+        action += " without questions (-y): options, current configuration and defaults answer them"
     paragraph(
         f"""
         {BOLD}{TOOL_NAME}{RESET}: upload the backups of node {node} to Google Drive.
-        {action}: nothing is installed before the final confirmation, Ctrl+C aborts.
+        {action}.
         """
     )
+    if not INTERACTIVE and previous is None:
+        # Fail before connecting the account, which already writes the remote.
+        missing = []
+        if args.encrypt is None:
+            missing.append("--encrypt or --no-encrypt")
+        if args.remote is None and args.token is None:
+            missing.append(f"a Google account, --remote NAME for an rclone Google Drive remote or --token: {token_hint(args)}")
+        if missing:
+            raise ToolError("a first setup with -y needs " + ", and ".join(missing))
     step_prerequisites()
-    storage = step_storage(previous)
-    rclone_config, drive_remote = step_google_account(previous)
-    destination = step_destination(previous, rclone_config, drive_remote, node)
-    options = step_upload_options(previous)
+    storage = step_storage(previous, args.storage)
+    rclone_config, drive_remote = step_google_account(previous, args)
+    destination = step_destination(previous, rclone_config, drive_remote, node, args)
+    options = step_upload_options(previous, args)
 
     heading(f"Step {STEPS}/{STEPS} - Review and install")
-    previous_hook, chain = step_hook(previous)
+    previous_hook, chain = step_hook(previous, args.existing_hook)
     settings = replace(
         options,
         storage=storage.storage_id,
@@ -1294,7 +1446,7 @@ def cmd_setup(_args: argparse.Namespace) -> None:
         show_new_passwords(destination.new_passwords, settings)
 
     print()
-    if ask_yes_no("Upload the current backups now?", True):
+    if ask_yes_no("Upload the current backups now?", True, args.upload_now):
         trigger_upload()
         print(f"Upload started in the background: journalctl -fu {TOOL_NAME} to follow it.")
     print(f"\nFrom now on every backup to {storage.storage_id} is uploaded when its job ends.")
@@ -1487,6 +1639,10 @@ def cmd_status(_args: argparse.Namespace) -> None:
 
 def cmd_uninstall(args: argparse.Namespace) -> None:
     settings = load_previous_settings()
+    removed = "hook, service and program" + (", configuration and notification templates" if args.purge else "")
+    question = f"Remove {TOOL_NAME} from {local_node_name()} ({removed})? The backups on Drive stay."
+    if INTERACTIVE and not ask_yes_no(question, False):
+        raise ToolError("aborted, nothing removed")
     if read_vzdump_option("script") == str(HOOK_PATH):
         restore = settings.previous_hook if settings else ""
         # vzdump fails every backup whose hook script is missing.
@@ -1522,7 +1678,38 @@ def require_root_on_pve() -> None:
         raise ToolError("pvesh not found: this is not a Proxmox VE node")
 
 
+def add_setup_options(setup: argparse.ArgumentParser) -> None:
+    """One option per wizard question: a given option skips the question."""
+    on_off = argparse.BooleanOptionalAction
+    setup.add_argument("--storage", metavar="ID", help="backup storage to upload")
+    account = setup.add_argument_group(
+        "Google account",
+        "Either an rclone Google Drive remote (--remote), or a token from 'rclone authorize' on a computer with a"
+        " browser (--token, stored as --remote, default gdrive). Without -y, a new remote signs in from here.",
+    )
+    account.add_argument("--remote", metavar="NAME", help="rclone Google Drive remote to use or create")
+    account.add_argument("--client-id", metavar="ID", help="your Google OAuth client for a new remote")
+    account.add_argument("--client-secret", metavar="SECRET", help="its client secret")
+    account.add_argument("--scope", choices=sorted(DRIVE_SCOPES), help="Drive access of a new remote (default drive.file)")
+    account.add_argument("--token", metavar="JSON", help="token printed by rclone authorize, {...} included")
+    upload = setup.add_argument_group("Destination and upload")
+    upload.add_argument("--folder", metavar="PATH", help="folder on Drive (default Backups/Proxmox/<node>)")
+    upload.add_argument("--encrypt", action=on_off, help="encrypt with rclone crypt (required with -y on a first setup)")
+    upload.add_argument("--mode", choices=("mirror", "copy"), help="mirror deletes from Drive what is pruned locally (default mirror)")
+    upload.add_argument("--trash", action=on_off, help="deleted backups go to the Drive trash (default yes)")
+    upload.add_argument("--bwlimit", metavar="LIMIT", help="rclone bandwidth limit, e.g. 30M, empty for none")
+    upload.add_argument("--notify-failure", action=on_off, help="notify failed uploads (default yes)")
+    upload.add_argument("--notify-success", action=on_off, help="notify successful uploads (default no)")
+    upload.add_argument(
+        "--existing-hook",
+        choices=("replace", "chain"),
+        help="what to do with a hook script already in /etc/vzdump.conf (required with -y if there is one)",
+    )
+    upload.add_argument("--upload-now", action=on_off, help="upload the current backups at the end (default yes)")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    global INTERACTIVE
     parser = argparse.ArgumentParser(prog=TOOL_NAME, description="Upload Proxmox VE backups to Google Drive.")
     commands = parser.add_subparsers(dest="command", required=True)
     for name, handler, help_text in (
@@ -1533,14 +1720,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         ("uninstall", cmd_uninstall, "remove hook, service and program"),
         ("upload", cmd_upload, "upload in the foreground (used by the service)"),
     ):
-        command = commands.add_parser(name, help=help_text)
+        command = commands.add_parser(name, help=help_text, description=help_text)
         command.set_defaults(handler=handler)
+        if name in ("setup", "uninstall"):
+            command.add_argument("-y", "--yes", action="store_true", help="do not ask anything")
+        if name == "setup":
+            command.description = (
+                "Interactive wizard that installs or reconfigures the upload. Every question has an option, which"
+                " skips it; with -y nothing is asked, and what the options do not say comes from the current"
+                " configuration or the defaults."
+            )
+            add_setup_options(command)
         if name == "uninstall":
             command.add_argument("--purge", action="store_true", help="also remove the configuration and templates")
 
     args = parser.parse_args(argv)
     try:
         require_root_on_pve()
+        if getattr(args, "yes", False):
+            INTERACTIVE = False
+        elif hasattr(args, "yes") and not sys.stdin.isatty():
+            raise ToolError("no terminal to answer the questions: add -y to run without them")
         return args.handler(args) or 0
     except ToolError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

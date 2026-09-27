@@ -44,20 +44,18 @@ interactive wizard that walks you through every step, Google sign-in included.
 
 ## Setup
 
-From your workstation (needs root SSH to the node that holds the backups):
+As root in the shell of the node that holds the backups:
 
 ```bash
-cd gdrive-backup                         # from the repository root
-./remote-deploy.sh root@node1            # runs the setup wizard
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/domysh/pve-tools/main/gdrive-backup/install.sh)"
 ```
 
-`remote-deploy.sh` forwards port 53682 over SSH, so the Google sign-in
-completes by itself when you open the printed link in your local browser.
-You can also run the wizard on the node, e.g. from the web shell, from a clone
-of the repository (see the main README) with
-`python3 /root/pve-tools/gdrive-backup/pve_gdrive_backup.py setup`: at the end
-of the sign-in the browser shows an error page, whose address you paste into
-the wizard.
+It runs the setup wizard, which installs the tool on the node: afterwards the
+`pve-gdrive-backup` command is available (see Operations). At the end of the
+Google sign-in the browser is sent to `http://127.0.0.1:53682/`. From the web
+shell that page fails to load: paste its address into the wizard. Over SSH,
+connect with `ssh -L 53682:127.0.0.1:53682 root@<node>` and the sign-in
+completes by itself.
 
 The wizard asks, in order:
 
@@ -80,7 +78,56 @@ The wizard asks, in order:
    tool's hook. Nothing is installed before this final confirmation.
 
 Run the wizard again at any time to change the configuration: it starts from
-the current values.
+the current values. The command above also updates the installed tool to the
+latest version; `pve-gdrive-backup setup` reconfigures the installed one.
+
+### Without questions
+
+Every question of the wizard has an option of `setup` that answers it, and
+`-y` asks nothing else: the rest comes from the current configuration or the
+defaults. So `-- setup -y` alone updates the tool and keeps the configuration,
+and a whole setup fits in one command:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/domysh/pve-tools/main/gdrive-backup/install.sh)" -- setup -y \
+    --storage hdd-backup --remote gdrive --folder Backups/Proxmox/node1 \
+    --no-encrypt --mode mirror --no-trash --bwlimit 30M
+```
+
+| Option | Answers |
+| --- | --- |
+| `--storage ID` | backup storage; required with `-y` if the node has several |
+| `--remote NAME` | rclone Google Drive remote to use; with `--token`, the one to create or update (default `gdrive`) |
+| `--client-id ID`, `--client-secret SECRET` | your OAuth client, for a new remote |
+| `--scope drive.file\|drive` | access scope of a new remote (default `drive.file`) |
+| `--token JSON` | a sign-in done on another computer, see below |
+| `--folder PATH` | folder on Drive (default `Backups/Proxmox/<node>`) |
+| `--encrypt`, `--no-encrypt` | encryption; required with `-y` on a first setup |
+| `--mode mirror\|copy` | what happens to backups pruned locally (default `mirror`) |
+| `--trash`, `--no-trash` | deleted backups go to the Drive trash, or are deleted permanently |
+| `--bwlimit LIMIT` | rclone bandwidth limit, `''` for none |
+| `--notify-failure`, `--notify-success` | notifications; `--no-notify-...` turns them off |
+| `--existing-hook replace\|chain` | a hook script already in `/etc/vzdump.conf`; required with `-y` if there is one |
+| `--upload-now`, `--no-upload-now` | upload the current backups right away (default yes) |
+
+With `-y` new encryption passwords are printed without waiting for you: save
+them from the output.
+
+**Signing in to Google without a browser on the node.** The sign-in needs a
+browser, but not on the node: on a computer with a browser and
+[rclone](https://rclone.org/downloads/), sign in with your OAuth client
+
+```bash
+rclone authorize drive "$(printf '{"client_id":"<client id>","client_secret":"<client secret>","scope":"drive.file"}' | base64 | tr '+/' '-_' | tr -d '=\n')"
+```
+
+and pass the token it prints, the whole `{...}`, with
+`--token '<token>' --client-id <client id> --client-secret <client secret>`.
+The setup tries the token before saving the remote, so a wrong one never
+replaces a working remote. `setup -y --client-id ... --client-secret ...`
+without an account prints this `rclone authorize` command ready to run. Like
+every option, the token stays in the shell history, and it grants access to
+your Drive.
 
 ### The Google OAuth client
 
@@ -117,7 +164,7 @@ only way to decrypt the backups. Files keep their names with a `.bin` suffix.
 
 ## Operations
 
-On the node (or from your workstation with `./remote-deploy.sh root@node1 <command>`):
+On the node:
 
 ```bash
 pve-gdrive-backup status              # configuration, last upload, local vs Drive
@@ -157,11 +204,11 @@ Google Drive remote with `rclone config`, then a `crypt` remote with
 ## Uninstall
 
 ```bash
-./remote-deploy.sh root@node1 uninstall            # hook, service and program
-./remote-deploy.sh root@node1 uninstall --purge    # also configuration and templates
+pve-gdrive-backup uninstall            # hook, service and program
+pve-gdrive-backup uninstall --purge    # also configuration and templates
 ```
 
-The hook script that was configured before the setup is put back. The rclone
+Both ask for confirmation (`-y` skips it). The hook script that was configured before the setup is put back. The rclone
 remotes (and the encryption passwords in them) and the backups on Google Drive
 are always kept.
 

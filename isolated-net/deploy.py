@@ -26,9 +26,14 @@ configuration is applied only when something is pending.
 
 Usage (as root on any cluster node)::
 
-    python3 deploy.py install [--config isolated-net.conf]
+    python3 deploy.py install [-y] [--config FILE] [--zone ZONE ...]
     python3 deploy.py status
-    python3 deploy.py uninstall [--purge]
+    python3 deploy.py uninstall [-y] [--purge]
+
+``install`` shows the settings it is going to use and asks to confirm or
+change them; with -y it asks nothing. Every KEY of isolated-net.conf is also
+an option (ZONE is --zone, SITE_PREFIX_LEN6 is --site-prefix-len6). Once the
+network exists, re-running ``install`` keeps its settings.
 """
 
 from __future__ import annotations
@@ -54,7 +59,6 @@ from typing import Any, Iterable, Sequence, Union
 IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
 TOOL_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG_PATH = TOOL_DIR / "isolated-net.conf"
 AGENT_SOURCE = TOOL_DIR / "agent" / "isolated_net_agent.py"
 UNIT_SOURCE = TOOL_DIR / "agent" / "isolated-net-agent.service"
 
@@ -80,6 +84,35 @@ class DeployError(RuntimeError):
 
 def log(message: str) -> None:
     print(f"==> {message}", flush=True)
+
+
+def ask(prompt: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    return input(f"{prompt}{suffix}: ").strip() or default
+
+
+def ask_yes_no(prompt: str, default: bool) -> bool:
+    hint = "Y/n" if default else "y/N"
+    while True:
+        answer = input(f"{prompt} [{hint}]: ").strip().lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes", "s", "si", "sì"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("  answer y or n")
+
+
+def choose(prompt: str, options: Sequence[str], default: int = 0) -> int:
+    """Pick one of the options; returns its 0-based index."""
+    for number, label in enumerate(options, start=1):
+        print(f"  {number}) {label}")
+    while True:
+        answer = input(f"{prompt} [{default + 1}]: ").strip() or str(default + 1)
+        if answer.isdigit() and 1 <= int(answer) <= len(options):
+            return int(answer) - 1
+        print(f"  choose a number from 1 to {len(options)}")
 
 
 # --------------------------------------------------------------------------
@@ -184,6 +217,33 @@ def parse_key_value_file(path: Path) -> dict[str, str]:
     return values
 
 
+# Every setting is a KEY=VALUE of the settings file and an install option
+# (ZONE is --zone): key -> (default, option metavar, description).
+SETTINGS = {
+    "ZONE": ("isolated", "ID", "SDN zone id, 2-8 lowercase letters/digits"),
+    "VNET": ("isonet", "ID", "vnet id, the bridge guests attach to, 2-8 lowercase letters/digits"),
+    "VNET_ALIAS": ("Isolated NAT network (internet only)", "TEXT", "vnet description shown in the web UI"),
+    "SUBNET4": ("auto", "CIDR", "IPv4 subnet, or auto"),
+    "SUBNET4_AUTO_PREFIX_LEN": ("22", "N", "prefix length of an auto IPv4 subnet"),
+    "SUBNET6": ("auto", "CIDR", "IPv6 subnet, or auto for a random unique local /64"),
+    "DNS4": ("", "IP", "IPv4 DNS server announced via DHCP, empty for the gateway"),
+    "DNS6": ("", "IP", "IPv6 DNS server announced via DHCP, empty for the gateway"),
+    "SITE_PREFIX_LEN6": ("48", "N", "also block the enclosing /N of on-link global IPv6 prefixes, 0 disables it"),
+    "EXTRA_BLOCKED": ("", "CIDRS", "more networks guests must never reach, comma separated"),
+}
+# Chosen when the network is created: other values would build another network.
+FIXED_SETTINGS = ("ZONE", "VNET", "SUBNET4", "SUBNET6")
+# Only used to create the SDN objects: later changes go through the web UI.
+CREATION_SETTINGS = ("VNET_ALIAS", "SUBNET4_AUTO_PREFIX_LEN", "DNS4", "DNS6")
+# Asked when changing the settings interactively; the others are options only.
+ASKED_SETTINGS = ("ZONE", "VNET", "SUBNET4", "SUBNET6", "DNS4", "DNS6", "SITE_PREFIX_LEN6", "EXTRA_BLOCKED")
+CLEARABLE_SETTINGS = ("DNS4", "DNS6", "EXTRA_BLOCKED")
+
+
+def option_name(key: str) -> str:
+    return "--" + key.lower().replace("_", "-")
+
+
 @dataclass(frozen=True)
 class Settings:
     """Validated deployment settings."""
@@ -200,19 +260,19 @@ class Settings:
     extra_blocked: tuple[IPNetwork, ...]
 
     @classmethod
-    def load(cls, path: Path) -> "Settings":
-        values = parse_key_value_file(path)
+    def from_values(cls, values: dict[str, str]) -> "Settings":
+        """Validate KEY=VALUE settings; missing or empty keys take the default."""
 
-        def get(key: str, default: str = "") -> str:
-            return values.get(key, default).strip()
+        def get(key: str) -> str:
+            return values.get(key, "").strip() or SETTINGS[key][0]
 
-        zone, vnet = get("ZONE", "isolated"), get("VNET", "isonet")
+        zone, vnet = get("ZONE"), get("VNET")
         for key, value in (("ZONE", zone), ("VNET", vnet)):
             if not SDN_ID_PATTERN.match(value):
                 raise DeployError(f"{key}={value!r}: use 2-8 lowercase letters/digits, starting with a letter")
 
         def optional_network(key: str, version: int) -> Any:
-            value = get(key, "auto")
+            value = get(key)
             if value.lower() == "auto":
                 return None
             try:
@@ -235,9 +295,9 @@ class Settings:
                 raise DeployError(f"{key} must be an IPv{version} address")
             return address
 
-        def integer(key: str, default: int, low: int, high: int) -> int:
+        def integer(key: str, low: int, high: int) -> int:
             try:
-                number = int(get(key, str(default)))
+                number = int(get(key))
             except ValueError as exc:
                 raise DeployError(f"{key} must be an integer") from exc
             if not low <= number <= high:
@@ -261,15 +321,97 @@ class Settings:
         return cls(
             zone=zone,
             vnet=vnet,
-            vnet_alias=get("VNET_ALIAS", "Isolated NAT network"),
+            vnet_alias=get("VNET_ALIAS"),
             subnet4=subnet4,
-            subnet4_auto_prefix_len=integer("SUBNET4_AUTO_PREFIX_LEN", 22, 16, 29),
+            subnet4_auto_prefix_len=integer("SUBNET4_AUTO_PREFIX_LEN", 16, 29),
             subnet6=subnet6,
             dns4=optional_address("DNS4", 4),
             dns6=optional_address("DNS6", 6),
-            site_prefix_len6=integer("SITE_PREFIX_LEN6", 48, 0, 64),
+            site_prefix_len6=integer("SITE_PREFIX_LEN6", 0, 64),
             extra_blocked=tuple(extra),
         )
+
+
+def same_setting(value: str, current: str) -> bool:
+    try:
+        return ipaddress.ip_network(value, strict=False) == ipaddress.ip_network(current, strict=False)
+    except ValueError:
+        return value == current
+
+
+def install_values(args: argparse.Namespace, deployed: dict[str, str] | None) -> dict[str, str]:
+    """Merge the options over --config and, once deployed, over the network's settings."""
+    options = {key: getattr(args, key.lower()) for key in SETTINGS if getattr(args, key.lower()) is not None}
+    requested = {**(parse_key_value_file(args.config) if args.config else {}), **options}
+    if deployed is None:
+        return requested
+    for key in FIXED_SETTINGS:
+        value, current = requested.get(key, "").strip(), deployed.get(key, "")
+        if value and value.lower() != "auto" and not same_setting(value, current):
+            raise DeployError(
+                f"{key}={value}, but the network was created with {key}={current} ({SHARED_CONFIG_PATH}); "
+                "to build it again with other settings, run uninstall --purge first"
+            )
+    for key in CREATION_SETTINGS:
+        if key in options:
+            log(f"WARNING: {option_name(key)} only applies when the network is created, ignored (use Datacenter > SDN)")
+    current = {key: value for key, value in deployed.items() if key in SETTINGS}
+    return {**current, **{key: value for key, value in requested.items() if key not in FIXED_SETTINGS}}
+
+
+def ask_setting(values: dict[str, str], key: str) -> str:
+    """Ask for one setting until the whole set is valid."""
+    default, _metavar, description = SETTINGS[key]
+    current = values.get(key, "").strip() or default
+    hint = " ('none' clears it)" if key in CLEARABLE_SETTINGS and current else ""
+    while True:
+        answer = ask(f"{key}: {description}{hint}", current)
+        if key in CLEARABLE_SETTINGS and answer.lower() == "none":
+            answer = ""
+        try:
+            Settings.from_values({**values, key: answer})
+        except DeployError as exc:
+            print(f"  {exc}")
+            continue
+        return answer
+
+
+def review_settings(values: dict[str, str], deployed: bool, nodes: Sequence[Node], interactive: bool) -> Settings:
+    """Show the settings and, interactively, let the user change them before anything is done."""
+    asked = [key for key in ASKED_SETTINGS if not deployed or key not in FIXED_SETTINGS + CREATION_SETTINGS]
+    while True:
+        settings = Settings.from_values(values)
+        if deployed:
+            print(f"\nExisting isolated network ({SHARED_CONFIG_PATH}), to update and reconcile:")
+        else:
+            print("\nNew isolated network:")
+        subnet4 = f"auto, the first free /{settings.subnet4_auto_prefix_len} from {AUTO_IPV4_START}"
+        rows = [
+            ("Zone / vnet", f"{settings.zone} / {settings.vnet} (guests use bridge={settings.vnet})"),
+            ("IPv4 subnet", str(settings.subnet4) if settings.subnet4 else subnet4),
+            ("IPv6 subnet", str(settings.subnet6) if settings.subnet6 else "auto, a random unique local (ULA) /64"),
+        ]
+        if not deployed:
+            rows.append(("DNS servers", f"IPv4 {settings.dns4 or 'gateway'}, IPv6 {settings.dns6 or 'gateway'}"))
+        site = settings.site_prefix_len6
+        rows.append(("IPv6 site block", f"the /{site} around each on-link global prefix" if site else "off"))
+        rows.append(("Extra blocked", ", ".join(str(network) for network in settings.extra_blocked) or "none"))
+        for label, value in rows:
+            print(f"  {label + ':':<17}{value}")
+        print(
+            f"\nOn {', '.join(node.name for node in nodes)}: dnsmasq and {SERVICE_NAME} are installed, and the SDN"
+            "\nconfiguration is applied if something changed (networking is reloaded).\n"
+        )
+        if not interactive:
+            return settings
+        choice = choose("Proceed", ["install with these settings", "change the settings", "abort"])
+        if choice == 0:
+            return settings
+        if choice == 2:
+            raise DeployError("aborted, nothing changed")
+        print()
+        for key in asked:
+            values[key] = ask_setting(values, key)
 
 
 # --------------------------------------------------------------------------
@@ -340,7 +482,7 @@ def pick_free_ipv4(prefix_len: int, used: Iterable[IPNetwork]) -> ipaddress.IPv4
         candidate = ipaddress.IPv4Network((base, prefix_len))
         if not any(candidate.overlaps(net) for net in used_v4):
             return candidate
-    raise DeployError("no free IPv4 subnet in 10.100.0.0-10.255.255.255, set SUBNET4 explicitly")
+    raise DeployError("no free IPv4 subnet in 10.100.0.0-10.255.255.255, choose one with --subnet4")
 
 
 def generate_ula_subnet() -> ipaddress.IPv6Network:
@@ -420,7 +562,7 @@ def ensure_subnets(settings: Settings, nodes: Sequence[Node]) -> tuple[IPNetwork
         if current:
             if requested is not None and requested not in current:
                 raise DeployError(
-                    f"vnet {settings.vnet} already has IPv{version} subnet {current[0]} but the config asks for "
+                    f"vnet {settings.vnet} already has IPv{version} subnet {current[0]} but the settings ask for "
                     f"{requested}; renumbering is not automatic (delete the subnet first)"
                 )
             log(f"IPv{version} subnet {current[0]} already present")
@@ -556,9 +698,9 @@ def write_shared_config(settings: Settings, subnet4: IPNetwork, subnet6: IPNetwo
     timestamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     content = f"""\
 # Generated by pve-tools isolated-net deploy.py on {timestamp}.
-# Shared by all nodes and read by isolated-net-agent; re-run deploy.py
-# instead of editing it. SUBNET4/SUBNET6 record the resolved subnets: copy
-# them into isolated-net.conf to reproduce the exact same network elsewhere.
+# Shared by all nodes and read by isolated-net-agent; re-run install instead
+# of editing it. SUBNET4/SUBNET6 record the resolved subnets: pass them with
+# --subnet4/--subnet6 to reproduce the exact same network elsewhere.
 ZONE={settings.zone}
 VNET={settings.vnet}
 SUBNET4={subnet4}
@@ -595,9 +737,10 @@ def require_root_on_pve() -> None:
 
 
 def cmd_install(args: argparse.Namespace) -> None:
-    settings = Settings.load(args.config)
+    deployed = parse_key_value_file(SHARED_CONFIG_PATH) if SHARED_CONFIG_PATH.exists() else None
+    values = install_values(args, deployed)
     nodes = cluster_nodes()
-    log(f"nodes: {', '.join(node.name for node in nodes)}")
+    settings = review_settings(values, deployed is not None, nodes, interactive=not args.yes)
 
     for node in nodes:
         log(f"[{node.name}] ensuring dnsmasq")
@@ -651,7 +794,23 @@ def cmd_status(_args: argparse.Namespace) -> None:
 
 
 def cmd_uninstall(args: argparse.Namespace) -> None:
+    config = parse_key_value_file(SHARED_CONFIG_PATH) if SHARED_CONFIG_PATH.exists() else {}
+    zone = config.get("ZONE") or SETTINGS["ZONE"][0]
+    vnet = config.get("VNET") or SETTINGS["VNET"][0]
     nodes = cluster_nodes()
+    if args.purge:
+        users = guests_using_vnet(vnet)
+        if users:
+            raise DeployError(f"vnet {vnet} is still used by: {', '.join(users)}")
+    if not args.yes:
+        names = ", ".join(node.name for node in nodes)
+        if args.purge:
+            question = f"Remove {SERVICE_NAME} from {names} and delete vnet {vnet} and zone {zone} with their subnets?"
+        else:
+            question = f"Remove {SERVICE_NAME} from {names}? Vnet {vnet} stays, without NAT and isolation."
+        if not ask_yes_no(question, False):
+            raise DeployError("aborted, nothing changed")
+
     for node in nodes:
         log(f"[{node.name}] removing {SERVICE_NAME}")
         print(node.run_script(UNINSTALL_AGENT_SCRIPT).strip())
@@ -659,13 +818,6 @@ def cmd_uninstall(args: argparse.Namespace) -> None:
     if not args.purge:
         log("agent removed; SDN zone/vnet kept (use --purge to delete them too)")
         return
-
-    config = parse_key_value_file(SHARED_CONFIG_PATH) if SHARED_CONFIG_PATH.exists() else {}
-    settings = Settings.load(args.config)
-    zone, vnet = config.get("ZONE", settings.zone), config.get("VNET", settings.vnet)
-    users = guests_using_vnet(vnet)
-    if users:
-        raise DeployError(f"vnet {vnet} is still used by: {', '.join(users)}")
 
     vnets = {entry["vnet"] for entry in pvesh("get", "/cluster/sdn/vnets") or []}
     if vnet in vnets:
@@ -685,10 +837,25 @@ def cmd_uninstall(args: argparse.Namespace) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Deploy an isolated NAT network on Proxmox VE SDN.")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="settings file")
     commands = parser.add_subparsers(dest="command", required=True)
+    yes_help = "do not ask anything"
 
-    install = commands.add_parser("install", help="create or reconcile the network (idempotent)")
+    install = commands.add_parser(
+        "install",
+        help="create or reconcile the network (idempotent)",
+        description="Create or reconcile the network. It shows the settings and asks to confirm or change them; "
+        "with -y it asks nothing. Options win over --config, which wins over the defaults. Once the network "
+        "exists, zone, vnet and subnets stay as they are and the other settings keep their current values.",
+    )
+    install.add_argument("-y", "--yes", action="store_true", help=yes_help)
+    install.add_argument("--config", type=Path, metavar="FILE", help="settings file of KEY=VALUE lines, like isolated-net.conf")
+    for key, (default, metavar, description) in SETTINGS.items():
+        install.add_argument(
+            option_name(key),
+            dest=key.lower(),
+            metavar=metavar,
+            help=description + (f" (default: {default})" if default else ""),
+        )
     install.add_argument("--skip-apply", action="store_true", help="do not apply the SDN configuration")
     install.add_argument("--force-apply", action="store_true", help="apply even if nothing is pending")
     install.set_defaults(handler=cmd_install)
@@ -697,16 +864,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     status.set_defaults(handler=cmd_status)
 
     uninstall = commands.add_parser("uninstall", help="remove the agent (and with --purge the SDN objects)")
+    uninstall.add_argument("-y", "--yes", action="store_true", help=yes_help)
     uninstall.add_argument("--purge", action="store_true", help="also delete subnets, vnet and zone")
     uninstall.set_defaults(handler=cmd_uninstall)
 
     args = parser.parse_args(argv)
     try:
         require_root_on_pve()
+        if getattr(args, "yes", True) is False and not sys.stdin.isatty():
+            raise DeployError("no terminal to answer the questions: add -y to run without them")
         args.handler(args)
     except DeployError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+    except (KeyboardInterrupt, EOFError):
+        print("\naborted", file=sys.stderr)
+        return 130
     return 0
 
 
