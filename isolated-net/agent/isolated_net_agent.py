@@ -29,10 +29,21 @@ treated as "local" and rejected. On top of that come:
 All of this is recomputed on every route/link/address change, so nothing
 depends on the current LAN addressing.
 
+Guests with another uplink
+--------------------------
+The SDN dnsmasq announces the vnet gateway as a default router. A guest that
+also has a default route of its own on another NIC (e.g. on the LAN) replies
+through whichever default the kernel picks, and replies leaving through the
+vnet with the other NIC's address are dropped as spoofed. The agent therefore
+announces the vnet gateway with *low* router preference (RFC 4191), so such
+guests keep their other IPv6 default, and logs spoofed packets (rate limited)
+so the IPv4 case, which DHCP cannot express, shows up in the journal.
+
 The agent is intentionally stateless: the only inputs are the shared config
 file in /etc/pve (cluster-wide), the applied SDN configuration and the
-kernel's routing table; the only outputs are one nftables table and a few
-sysctls. Rules are replaced atomically and only when their content changes.
+kernel's routing table; the only outputs are one nftables table, a few
+sysctls and one dnsmasq drop-in per zone. Rules are replaced atomically and
+only when their content changes.
 """
 
 from __future__ import annotations
@@ -48,9 +59,9 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence, Union
+from typing import Iterable, Mapping, Sequence, Union
 
 LOG = logging.getLogger("isolated-net-agent")
 
@@ -60,6 +71,8 @@ SHARED_CONFIG_PATH = Path("/etc/pve/isolated-net.conf")
 SDN_RUNNING_CONFIG_PATH = Path("/etc/pve/sdn/.running-config")
 IPAM_STATE_PATH = Path("/etc/pve/sdn/pve-ipam-state.json")
 DNSMASQ_LEASE_DIR = Path("/var/lib/misc")
+DNSMASQ_CONFIG_ROOT = Path("/etc/dnsmasq.d")
+DNSMASQ_DROPIN_NAME = "90-isolated-net.conf"
 LEASE_OWNERS_PATH = Path("/var/lib/isolated-net-agent/lease-owners.json")
 IPV6_CONF_ROOT = Path("/proc/sys/net/ipv6/conf")
 IPV4_FORWARD_PATH = Path("/proc/sys/net/ipv4/ip_forward")
@@ -199,6 +212,7 @@ class Topology:
     vnets: frozenset[str]
     internal_v4: tuple[ipaddress.IPv4Network, ...]
     internal_v6: tuple[ipaddress.IPv6Network, ...]
+    zone_vnets: Mapping[str, frozenset[str]] = field(default_factory=dict)
 
 
 def subnet_from_id(subnet_id: str) -> IPNetwork:
@@ -230,7 +244,11 @@ def load_topology(zones: frozenset[str], running_config_path: Path = SDN_RUNNING
         raise AgentError(f"cannot read {running_config_path}: {exc}") from exc
 
     vnet_entries = (running.get("vnets") or {}).get("ids") or {}
-    vnets = frozenset(name for name, entry in vnet_entries.items() if entry.get("zone") in zones)
+    zone_vnets = {
+        zone: frozenset(name for name, entry in vnet_entries.items() if entry.get("zone") == zone)
+        for zone in zones
+    }
+    vnets = frozenset().union(*zone_vnets.values())
 
     internal_v4: list[ipaddress.IPv4Network] = []
     internal_v6: list[ipaddress.IPv6Network] = []
@@ -244,7 +262,7 @@ def load_topology(zones: frozenset[str], running_config_path: Path = SDN_RUNNING
         else:
             internal_v6.append(network)
 
-    return Topology(vnets, tuple(internal_v4), tuple(internal_v6))
+    return Topology(vnets, tuple(internal_v4), tuple(internal_v6), zone_vnets)
 
 
 # --------------------------------------------------------------------------
@@ -482,11 +500,19 @@ table {NFT_FAMILY} {NFT_TABLE} {{
 \t\tct state established,related accept
 \t\tct state invalid drop
 \t\t# Anti-spoofing: only the vnet's own subnets may leave the node.
-\t\tmeta nfproto ipv4 ip saddr != @internal_v4 counter drop
-\t\tmeta nfproto ipv6 ip6 saddr != @internal_v6 counter drop
+\t\tmeta nfproto ipv4 ip saddr != @internal_v4 counter jump drop_spoofed
+\t\tmeta nfproto ipv6 ip6 saddr != @internal_v6 counter jump drop_spoofed
 \t\tip daddr @blocked_v4 counter reject with icmpx admin-prohibited
 \t\tip6 daddr @blocked_v6 counter reject with icmpx admin-prohibited
 \t\taccept
+\t}}
+
+\t# Rarely an attack: usually a guest with a second default route (e.g. a NIC
+\t# on the LAN) replying through the vnet with its other address. The MAC in
+\t# the log line identifies the guest NIC.
+\tchain drop_spoofed {{
+\t\tlimit rate 1/minute burst 5 packets log prefix "isolated-net spoofed: " level warn
+\t\tdrop
 \t}}
 
 \t# Nothing outside the isolated zone may open connections into it, except
@@ -527,6 +553,107 @@ def nft_delete_table() -> bool:
         return False
     run_command(["nft", "delete", "table", NFT_FAMILY, NFT_TABLE])
     return True
+
+
+# --------------------------------------------------------------------------
+# Router preference (dnsmasq drop-in)
+# --------------------------------------------------------------------------
+#
+# The SDN dnsmasq advertises the vnet gateway with the default (medium)
+# preference. A guest with another IPv6 default of its own then has two equal
+# defaults, and which one the kernel uses depends on the order in which they
+# appeared. With *low* preference the vnet default is only used when it is the
+# only one (or the other router is unreachable).
+#
+# On every SDN apply PVE rewrites 00-default.conf, deletes 10-*.conf and
+# restarts dnsmasq@<zone>; other files in the directory are left alone.
+# dnsmasq reads them in alphabetical order and an ra-param parsed later takes
+# precedence, so the drop-in overrides PVE's "ra-param=*" for the vnets.
+
+DNSMASQ_DROPIN_HEADER = """\
+# Managed by isolated-net-agent, do not edit.
+# The vnet gateway is advertised with low router preference (RFC 4191), so a
+# guest that also has another IPv6 default route keeps using that one.
+"""
+
+
+def vnet_ra_param(vnet: str, pve_default_config: str) -> str:
+    """Build the ``ra-param`` line that advertises ``vnet`` with low preference.
+
+    The other arguments (the MTU above all) are copied from PVE's own
+    ``ra-param=*,[mtu:<value>,][high|low,]<interval>[,<lifetime>]`` so the
+    advertisements differ only in their preference.
+    """
+    arguments = ["0"]
+    for line in pve_default_config.splitlines():
+        if line.strip().startswith("ra-param=*,"):
+            arguments = line.strip().split(",")[1:]
+    mtu = [arguments.pop(0)] if arguments and arguments[0].startswith("mtu:") else []
+    if arguments and arguments[0] in ("high", "low"):
+        arguments.pop(0)
+    return "ra-param=" + ",".join([vnet, *mtu, "low", *(arguments or ["0"])])
+
+
+def render_dnsmasq_dropins(topology: Topology, config_root: Path = DNSMASQ_CONFIG_ROOT) -> dict[Path, str]:
+    """Return ``{path: content}`` of the drop-ins the isolated zones need here.
+
+    A zone whose dnsmasq configuration does not exist on this node (SDN not
+    applied yet, or not using the dnsmasq DHCP backend) gets none.
+    """
+    dropins: dict[Path, str] = {}
+    for zone, vnets in sorted(topology.zone_vnets.items()):
+        try:
+            pve_default = (config_root / zone / "00-default.conf").read_text()
+        except FileNotFoundError:
+            continue
+        if vnets:
+            lines = [vnet_ra_param(vnet, pve_default) for vnet in sorted(vnets)]
+            dropins[config_root / zone / DNSMASQ_DROPIN_NAME] = DNSMASQ_DROPIN_HEADER + "\n".join(lines) + "\n"
+    return dropins
+
+
+def restart_dnsmasq(zone: str) -> None:
+    """Restart dnsmasq@<zone> if it runs; router advertisement settings are read only at startup.
+
+    A stopped instance is left alone: it reads the drop-in when PVE starts it.
+    """
+    run_command(["systemctl", "try-restart", f"dnsmasq@{zone}"])
+
+
+def write_dnsmasq_dropin(path: Path, content: str) -> None:
+    """Install one drop-in and restart dnsmasq; restore the previous file if dnsmasq fails.
+
+    The unit validates its configuration before starting, so a drop-in it
+    rejects would otherwise leave the zone without DHCP and DNS.
+    """
+    try:
+        previous: str | None = path.read_text()
+    except FileNotFoundError:
+        previous = None
+    temporary = path.with_suffix(".tmp")  # not *.conf: dnsmasq ignores it
+    temporary.write_text(content)
+    temporary.replace(path)
+    try:
+        restart_dnsmasq(path.parent.name)
+    except AgentError:
+        if previous is None:
+            path.unlink()
+        else:
+            path.write_text(previous)
+        try:
+            restart_dnsmasq(path.parent.name)
+        except AgentError as exc:
+            LOG.error("dnsmasq@%s does not start even with the previous configuration: %s", path.parent.name, exc)
+        raise
+    LOG.info("%s %s, restarted dnsmasq@%s", "updated" if previous else "created", path, path.parent.name)
+
+
+def remove_dnsmasq_dropins(keep: Iterable[Path] = (), config_root: Path = DNSMASQ_CONFIG_ROOT) -> None:
+    """Delete the managed drop-ins not in ``keep`` and restart the affected dnsmasq instances."""
+    for path in sorted(set(config_root.glob(f"*/{DNSMASQ_DROPIN_NAME}")) - set(keep)):
+        path.unlink()
+        restart_dnsmasq(path.parent.name)
+        LOG.info("removed %s, restarted dnsmasq@%s", path, path.parent.name)
 
 
 # --------------------------------------------------------------------------
@@ -742,10 +869,11 @@ class DesiredState:
     topology: Topology
     uplinks: set[str]
     ruleset: str | None  # None means "no isolated zone configured"
+    dnsmasq_dropins: dict[Path, str] = field(default_factory=dict)
 
 
 def compute_desired_state(config_path: Path) -> DesiredState:
-    """Read all inputs and compute the ruleset without touching the system."""
+    """Read all inputs and compute the ruleset and drop-ins without touching the system."""
     config = AgentConfig.load(config_path)
     if not config.zones:
         return DesiredState(config, Topology(frozenset(), (), ()), set(), None)
@@ -759,7 +887,7 @@ def compute_desired_state(config_path: Path) -> DesiredState:
         compute_blocked(4, routes_v4, topology, config),
         compute_blocked(6, routes_v6, topology, config),
     )
-    return DesiredState(config, topology, uplinks, ruleset)
+    return DesiredState(config, topology, uplinks, ruleset, render_dnsmasq_dropins(topology))
 
 
 class Agent:
@@ -770,20 +898,28 @@ class Agent:
         self.applied_digest: str | None = None
         self.force_sync = True
         self.stop_requested = False
+        # Drop-ins dnsmasq refused to start with; not retried until they change.
+        self.rejected_dropins: dict[Path, str] = {}
 
     def sync(self) -> None:
-        """Reconcile kernel settings and nftables with the desired state."""
+        """Reconcile kernel settings, nftables and dnsmasq with the desired state."""
         state = compute_desired_state(self.config_path)
         if state.ruleset is None:
             if nft_delete_table():
                 LOG.info("no isolated zone configured: removed table %s", NFT_TABLE)
             self.applied_digest = None
+            remove_dnsmasq_dropins()
             return
 
         ensure_kernel_settings(state.uplinks, state.topology.vnets)
         self.sync_ruleset(state)
 
-        # Lease hygiene is best effort and must never block NAT/isolation.
+        # The router preference and the lease hygiene are best effort and
+        # must never block NAT/isolation.
+        try:
+            self.sync_dnsmasq_dropins(state.dnsmasq_dropins)
+        except (AgentError, OSError) as exc:
+            LOG.warning("dnsmasq drop-in update failed: %s", exc)
         try:
             clean_stale_leases(state.config.zones)
         except (AgentError, OSError, ValueError) as exc:
@@ -803,6 +939,23 @@ class Agent:
             ",".join(str(n) for n in state.topology.internal_v4 + state.topology.internal_v6) or "-",
             ",".join(sorted(state.uplinks)) or "-",
         )
+
+    def sync_dnsmasq_dropins(self, dropins: dict[Path, str]) -> None:
+        """Write the drop-ins whose content changed and remove the obsolete ones."""
+        for path, content in sorted(dropins.items()):
+            try:
+                if path.read_text() == content:
+                    continue
+            except FileNotFoundError:
+                pass
+            if self.rejected_dropins.get(path) == content:
+                continue
+            try:
+                write_dnsmasq_dropin(path, content)
+            except AgentError:
+                self.rejected_dropins[path] = content
+                raise
+        remove_dnsmasq_dropins(keep=dropins)
 
     def safe_sync(self) -> None:
         """Run a sync, logging (instead of propagating) recoverable errors.
@@ -911,7 +1064,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="run",
         choices=("run", "sync", "show", "cleanup"),
         help="run: daemon (default); sync: reconcile once; "
-        "show: print the ruleset without applying; cleanup: remove the table",
+        "show: print the ruleset and dnsmasq drop-ins without applying; "
+        "cleanup: remove the table and the drop-ins",
     )
     args = parser.parse_args(argv)
 
@@ -925,9 +1079,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "show":
             state = compute_desired_state(args.config)
             print(state.ruleset if state.ruleset else "# no isolated zone configured")
+            for path, content in sorted(state.dnsmasq_dropins.items()):
+                print(f"\n# {path}:")
+                print("\n".join(f"#   {line}" for line in content.splitlines()))
         elif args.command == "cleanup":
             removed = nft_delete_table()
             LOG.info("table %s %s", NFT_TABLE, "removed" if removed else "was not loaded")
+            remove_dnsmasq_dropins()
         elif args.command == "sync":
             Agent(args.config).sync()
         else:

@@ -40,10 +40,10 @@ Two parts:
    it as `SNAT --to-source <node IP> -o <iface>` at apply time, which breaks as
    soon as the node's address or uplink changes.
 2. **isolated-net-agent** (`agent/isolated_net_agent.py`, systemd service on
-   every node): owns one nftables table and keeps it in sync with the applied
-   SDN config and the routing table. It reacts to `ip monitor` events and
-   resyncs every 30 s; updates are atomic and only happen when the rendered
-   ruleset changes.
+   every node): owns one nftables table and one dnsmasq drop-in per zone, and
+   keeps them in sync with the applied SDN config and the routing table. It
+   reacts to `ip monitor` events and resyncs every 30 s; updates are atomic and
+   only happen when the rendered ruleset changes.
 
 ### What is blocked
 
@@ -60,8 +60,31 @@ A guest may reach a destination only if the node would send it through a
   by the LAN router;
 * the `--extra-blocked` networks.
 
-Plus anti-spoofing (only the vnet subnets may leave the node) and TCP MSS
-clamping to the route MTU (useful with PPPoE uplinks).
+Plus anti-spoofing (only the vnet subnets may leave the node; drops are
+logged, see [below](#guests-with-another-uplink)) and TCP MSS clamping to the
+route MTU (useful with PPPoE uplinks).
+
+### Guests with another uplink
+
+A guest on the vnet may also have a NIC with a default route of its own, e.g.
+a reverse proxy on the LAN that reaches its backends on the vnet. The vnet's
+DHCP and router advertisements announce a default route too, so replies to
+connections that arrived on the other NIC may leave through the vnet with the
+other NIC's address: the anti-spoofing rule drops them, and inbound services
+work only intermittently.
+
+* **IPv6** is handled by the agent: it advertises the vnet gateway with *low*
+  router preference (RFC 4191) through `/etc/dnsmasq.d/<zone>/90-isolated-net.conf`
+  (PVE only rewrites `00-default.conf` and `10-*.conf`; the agent restarts
+  `dnsmasq@<zone>` when the drop-in changes). A guest with another default
+  route keeps using it; guests that only sit on the vnet are unaffected.
+* **IPv4** cannot be fixed on the network side: DHCP has no route preference,
+  and Linux picks among equal-metric defaults by neighbour state, so the route
+  flips back and forth. Such guests must ignore the vnet's gateway, see
+  [Using the network](#using-the-network).
+* Dropped packets are **logged** in the kernel log as `isolated-net spoofed:`
+  (5 lines, then at most one per minute). The second address after `MAC=` is
+  the guest NIC.
 
 ### DHCP lease hygiene
 
@@ -170,11 +193,24 @@ pct set <vmid> --nameserver "<IPv4 gateway> <IPv6 gateway>"
 
 VMs are not affected: they take the DNS server from DHCP.
 
+**Guests with another uplink** ([why](#guests-with-another-uplink)): make them
+ignore the vnet's IPv4 gateway. With systemd-networkd (e.g. an LXC with
+`name=srvnet` on the vnet) use a drop-in, since Proxmox rewrites
+`srvnet.network` at every container start:
+
+```bash
+mkdir -p /etc/systemd/network/srvnet.network.d
+printf '[DHCPv4]\nUseGateway=no\n' > /etc/systemd/network/srvnet.network.d/no-gw.conf
+networkctl reload && networkctl reconfigure srvnet
+```
+
 ## Operations
 
 ```bash
 journalctl -u isolated-net-agent -f     # agent log
-isolated-net-agent show                 # ruleset the agent would apply
+journalctl -k -g "isolated-net spoofed" # guests sending with a foreign source address
+grep -ril <mac> /etc/pve/nodes/*/lxc /etc/pve/nodes/*/qemu-server  # which guest owns a MAC
+isolated-net-agent show                 # ruleset and dnsmasq drop-ins the agent would apply
 nft list table inet isolated_net        # live ruleset and counters
 systemctl reload isolated-net-agent     # force a resync
 ```
