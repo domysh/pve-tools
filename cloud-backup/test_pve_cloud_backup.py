@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Self-check of the parts that are easy to break: python3 test_pve_cloud_backup.py.
+
+Runs anywhere (no Proxmox, no rclone, no root): it only touches the settings
+file and the rclone command line.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+import tempfile
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("tool", Path(__file__).with_name("pve_cloud_backup.py"))
+assert spec and spec.loader
+tool = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = tool  # dataclasses looks the module up by name
+spec.loader.exec_module(tool)
+
+SETTINGS = tool.Settings(
+    storage="hdd-backup",
+    rclone_config="/root/.config/rclone/rclone.conf",
+    remote="proton",
+    folder="Backups/Proxmox/node1",
+    mode="copy",
+    use_trash=False,
+    bwlimit="30M",
+)
+
+
+def test_settings_round_trip(directory: Path) -> None:
+    tool.CONFIG_PATH = directory / "pve-cloud-backup.conf"
+    SETTINGS.save()
+    assert tool.Settings.load() == SETTINGS
+
+
+def test_legacy_config_is_read(directory: Path) -> None:
+    """A pve-gdrive-backup configuration still loads, DRIVE_REMOTE included."""
+    legacy = directory / "pve-gdrive-backup.conf"
+    legacy.write_text("STORAGE=hdd\nRCLONE_CONFIG=/x/rclone.conf\nDRIVE_REMOTE=gdrive\nFOLDER=Backups/node1\n")
+    settings = tool.Settings.load(legacy)
+    assert settings.remote == "gdrive"
+    assert settings.destination == "gdrive:Backups/node1/dump"
+
+
+def test_destination() -> None:
+    assert SETTINGS.destination == "proton:Backups/Proxmox/node1/dump"
+    assert tool.replace(SETTINGS, encrypt=True).destination == f"{tool.CRYPT_REMOTE}:dump"
+
+
+def test_backend_flags() -> None:
+    """Only a Drive remote gets the Drive flags; the trash flag follows the setting."""
+    dump = Path("/mnt/hdd/dump")
+    drive = tool.build_rclone_command(tool.replace(SETTINGS, remote="gdrive"), dump, "drive")
+    assert drive[1] == "copy"  # mode=copy
+    assert "--drive-stop-on-upload-limit" in drive
+    assert "--drive-use-trash=false" in drive
+    assert "--drive-use-trash=true" in tool.build_rclone_command(tool.replace(SETTINGS, use_trash=True), dump, "drive")
+
+    proton = tool.build_rclone_command(tool.replace(SETTINGS, mode="mirror"), dump, "protondrive")
+    assert proton[1] == "sync"
+    assert [flag for flag in proton if flag.startswith("--drive-")] == []
+    assert proton[-2:] == ["--bwlimit", "30M"]
+
+
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory() as name:
+        test_settings_round_trip(Path(name))
+        test_legacy_config_is_read(Path(name))
+    test_destination()
+    test_backend_flags()
+    print("ok")

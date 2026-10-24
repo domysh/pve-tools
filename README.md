@@ -25,14 +25,15 @@ any node of the cluster. [Documentation](isolated-net/)
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/domysh/pve-tools/main/isolated-net/install.sh)"
 ```
 
-### gdrive-backup
+### cloud-backup
 
-Automatic upload of vzdump backups to Google Drive after every backup job
-(rclone, optional encryption, Proxmox notifications), set up by a wizard. Run
-it on the node that holds the backups. [Documentation](gdrive-backup/)
+Automatic upload of vzdump backups to any cloud rclone supports (Google
+Drive, Proton Drive, S3, Dropbox...) after every backup job, with optional
+encryption and Proxmox notifications, set up by a wizard. Run it on the node
+that holds the backups. [Documentation](cloud-backup/)
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/domysh/pve-tools/main/gdrive-backup/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/domysh/pve-tools/main/cloud-backup/install.sh)"
 ```
 
 ## How the commands work
@@ -57,8 +58,8 @@ so nothing depends on the download afterwards.
   options.
 * **Without questions**: every question has an option that answers it, and
   `-y` asks nothing else, taking the current configuration or the defaults for
-  the rest. Choices that cannot be made for you (which storage, which Google
-  account, encryption...) must then be given as options, otherwise the tool
+  the rest. Choices that cannot be made for you (which storage, which cloud
+  remote, encryption...) must then be given as options, otherwise the tool
   stops with an error that names them. This makes a setup scriptable and
   reproducible on another node:
 
