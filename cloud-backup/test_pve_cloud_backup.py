@@ -64,10 +64,21 @@ def test_backend_flags() -> None:
     assert proton[-2:] == ["--bwlimit", "30M"]
 
 
+def test_bwlimit_words_mean_no_limit() -> None:
+    """A limit already set needs a word to go away: an empty line keeps the default."""
+    for word in ("", "unlimited", " Unlimited ", "none", "off"):
+        assert tool.normalize_bwlimit(word) == ""
+    assert tool.normalize_bwlimit(" 30M ") == "30M"
+    assert tool.normalize_bwlimit("08:00,5M 23:00,off") == "08:00,5M 23:00,off"
+    unlimited = tool.build_rclone_command(tool.replace(SETTINGS, bwlimit=""), Path("/mnt/hdd/dump"), "drive")
+    assert "--bwlimit" not in unlimited
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as name:
         test_settings_round_trip(Path(name))
         test_legacy_config_is_read(Path(name))
     test_destination()
     test_backend_flags()
+    test_bwlimit_words_mean_no_limit()
     print("ok")

@@ -316,7 +316,8 @@ MODE={self.mode}
 # Deleted files go to the provider's trash (yes) or are deleted permanently
 # (no); only backends with a trash rclone can control honour it.
 USE_TRASH={yes_no(self.use_trash)}
-# rclone --bwlimit value, empty for unlimited.
+# rclone --bwlimit value, empty for unlimited (the setup also takes the word
+# "unlimited", "none" or "off" and stores it as empty).
 BWLIMIT={self.bwlimit}
 NOTIFY_ON_FAILURE={yes_no(self.notify_failure)}
 NOTIFY_ON_SUCCESS={yes_no(self.notify_success)}
@@ -1322,8 +1323,19 @@ def step_destination(
     return Destination(folder, True, values, passwords)
 
 
+# Written as BWLIMIT= (empty). A default answers an empty line in the wizard,
+# so a limit already set needs a word to take it away again.
+NO_BWLIMIT = ("", "unlimited", "none", "off")
+
+
+def normalize_bwlimit(value: str) -> str:
+    """The words that mean "no limit" are stored as an empty BWLIMIT."""
+    value = value.strip()
+    return "" if value.lower() in NO_BWLIMIT else value
+
+
 def validate_bwlimit(value: str) -> str | None:
-    if not value:
+    if not normalize_bwlimit(value):
         return None
     result = subprocess.run(
         ["rclone", "--config", os.devnull, "--bwlimit", value, "listremotes"],
@@ -1362,12 +1374,14 @@ def step_upload_options(previous: Settings | None, opts: argparse.Namespace, kin
         ) == 0
 
     print()
-    bwlimit = ask(
-        "Upload bandwidth limit, e.g. 30M (MiB/s) or a timetable like '08:00,5M 23:00,off' (empty: unlimited)",
-        defaults.bwlimit,
-        validate_bwlimit,
-        opts.bwlimit,
-        "--bwlimit",
+    bwlimit = normalize_bwlimit(
+        ask(
+            "Upload bandwidth limit: 30M (MiB/s), a timetable like '08:00,5M 23:00,off', or unlimited",
+            defaults.bwlimit or "unlimited",
+            validate_bwlimit,
+            opts.bwlimit,
+            "--bwlimit",
+        )
     )
 
     print()
@@ -1839,7 +1853,7 @@ def add_setup_options(setup: argparse.ArgumentParser) -> None:
     upload.add_argument("--encrypt", action=on_off, help="encrypt with rclone crypt (required with -y on a first setup)")
     upload.add_argument("--mode", choices=("mirror", "copy"), help="mirror deletes from the remote what is pruned locally (default mirror)")
     upload.add_argument("--trash", action=on_off, help="deleted backups go to the trash, where the provider has one (default yes)")
-    upload.add_argument("--bwlimit", metavar="LIMIT", help="rclone bandwidth limit, e.g. 30M, empty for none")
+    upload.add_argument("--bwlimit", metavar="LIMIT", help="rclone bandwidth limit, e.g. 30M, or unlimited for none")
     upload.add_argument("--notify-failure", action=on_off, help="notify failed uploads (default yes)")
     upload.add_argument("--notify-success", action=on_off, help="notify successful uploads (default no)")
     upload.add_argument(

@@ -73,7 +73,8 @@ The wizard asks, in order:
    contains: files already there are not uploaded again.
 5. **Upload behaviour**: mirror or copy, trash or permanent deletion (only
    where the provider has a trash rclone can choose, i.e. Google Drive),
-   bandwidth limit, notifications.
+   bandwidth limit (`unlimited` takes away a limit set before: an empty line
+   keeps the current value, like every other question), notifications.
 6. **Review and install**: if `/etc/vzdump.conf` already has a hook script,
    the wizard shows it and lets you replace it or keep it chained after this
    tool's hook. Nothing is installed before this final confirmation.
@@ -118,7 +119,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/domysh/pve-tools/main/cl
 | `--encrypt`, `--no-encrypt` | encryption; required with `-y` on a first setup |
 | `--mode mirror\|copy` | what happens to backups pruned locally (default `mirror`) |
 | `--trash`, `--no-trash` | deleted backups go to the provider's trash, or are deleted permanently (Google Drive only) |
-| `--bwlimit LIMIT` | rclone bandwidth limit, `''` for none |
+| `--bwlimit LIMIT` | rclone bandwidth limit, e.g. `30M` or a timetable; `unlimited` (or `none`, `off`, `''`) for no limit |
 | `--notify-failure`, `--notify-success` | notifications; `--no-notify-...` turns them off |
 | `--existing-hook replace\|chain` | a hook script already in `/etc/vzdump.conf`; required with `-y` if there is one |
 | `--upload-now`, `--no-upload-now` | upload the current backups right away (default yes) |
@@ -272,5 +273,6 @@ python3 cloud-backup/test_pve_cloud_backup.py
 ```
 
 Checks the settings file (the old `DRIVE_REMOTE` key included), the
-destination paths and the rclone command line per backend. Needs neither
+destination paths, the bandwidth limit and the rclone command line per
+backend. Needs neither
 Proxmox nor rclone.
