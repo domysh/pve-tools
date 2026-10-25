@@ -191,6 +191,9 @@ With encryption on, the wizard creates the rclone crypt remote
 passwords once: **store them in a password manager**. They are also in
 `rclone.conf` (obfuscated, not encrypted), but if the node is lost they are the
 only way to decrypt the backups. Files keep their names with a `.bin` suffix.
+If the crypt remote already exists (from an earlier setup), its passwords are
+reused and not shown: `pve-cloud-backup show-passwords` prints them at any
+time.
 
 ## Operations
 
@@ -201,6 +204,7 @@ pve-cloud-backup status              # configuration, last upload, local vs remo
 pve-cloud-backup run                 # upload now (in the background)
 journalctl -fu pve-cloud-backup      # follow the upload log
 pve-cloud-backup test-notification   # check that notifications reach you
+pve-cloud-backup show-passwords      # encryption passwords, to store elsewhere
 ```
 
 Notifications carry the field `type=cloud-backup`, so a notification matcher

@@ -34,6 +34,7 @@ Usage (as root on the node that holds the backups)::
     pve-cloud-backup status                # configuration, last upload, drift
     pve-cloud-backup run                   # upload now, in the background
     pve-cloud-backup test-notification
+    pve-cloud-backup show-passwords        # encryption passwords, to store elsewhere
     pve-cloud-backup uninstall [-y] [--purge]
 """
 
@@ -1384,6 +1385,7 @@ def step_destination(
         # Reuse the existing passwords: anything already encrypted stays readable.
         values.update(password=crypt["password"], password2=crypt.get("password2", ""))
         print(f"  Reusing the encryption passwords of the rclone remote {CRYPT_REMOTE}.")
+        print(f"  '{TOOL_NAME} show-passwords' prints them: keep a copy outside this node.")
         return Destination(folder, True, values, None)
     passwords = (secrets.token_urlsafe(32), secrets.token_urlsafe(32))
     values.update(password=rclone_obscure(passwords[0]), password2=rclone_obscure(passwords[1]))
@@ -1558,7 +1560,7 @@ def trigger_upload() -> None:
     run(["systemctl", "start", "--no-block", SERVICE_NAME])
 
 
-def show_new_passwords(passwords: tuple[str, str], settings: Settings) -> None:
+def show_passwords(passwords: tuple[str, str], settings: Settings) -> None:
     heading("IMPORTANT: save the encryption passwords")
     paragraph(
         f"""
@@ -1570,13 +1572,11 @@ def show_new_passwords(passwords: tuple[str, str], settings: Settings) -> None:
           password2: {passwords[1]}
 
         To restore from any machine with rclone: add the same remote, then a
-        "crypt" remote with remote = <remote>:{settings.folder},
+        "crypt" remote with remote = {settings.remote}:{settings.folder},
         filename_encryption = off, directory_name_encryption = false and these
         two passwords ("Yes, type in my own password").
         """
     )
-    while INTERACTIVE and input('Type "saved" once you have stored them: ').strip().lower() != "saved":
-        pass
 
 
 def cmd_setup(args: argparse.Namespace) -> None:
@@ -1655,7 +1655,9 @@ def cmd_setup(args: argparse.Namespace) -> None:
     remove_legacy_install()
     log(f"installed; configuration in {CONFIG_PATH}")
     if destination.new_passwords:
-        show_new_passwords(destination.new_passwords, settings)
+        show_passwords(destination.new_passwords, settings)
+        while INTERACTIVE and input('Type "saved" once you have stored them: ').strip().lower() != "saved":
+            pass
 
     print()
     if ask_yes_no("Upload the current backups now?", True, args.upload_now):
@@ -1837,6 +1839,16 @@ def cmd_run(_args: argparse.Namespace) -> None:
     print(f"Upload started in the background: journalctl -fu {TOOL_NAME} to follow it.")
 
 
+def cmd_show_passwords(_args: argparse.Namespace) -> None:
+    settings = Settings.load()
+    parser = read_rclone_config(Path(settings.rclone_config))
+    crypt = next((parser[name] for name in (CRYPT_REMOTE, LEGACY_CRYPT_REMOTE) if parser.has_section(name)), None)
+    if not settings.encrypt or crypt is None or not crypt.get("password"):
+        raise ToolError("encryption is off: there are no passwords to show")
+    password2 = crypt.get("password2", "")
+    show_passwords((rclone_reveal(crypt["password"]), rclone_reveal(password2) if password2 else ""), settings)
+
+
 def cmd_test_notification(_args: argparse.Namespace) -> None:
     node = local_node_name()
     send_notification(
@@ -1985,6 +1997,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ("status", cmd_status, "show the configuration, the last upload and what is pending"),
         ("run", cmd_run, "upload now, in the background"),
         ("test-notification", cmd_test_notification, "send a test notification"),
+        ("show-passwords", cmd_show_passwords, "print the encryption passwords, to keep a copy elsewhere"),
         ("uninstall", cmd_uninstall, "remove hook, service and program"),
         ("upload", cmd_upload, "upload in the foreground (used by the service)"),
     ):
