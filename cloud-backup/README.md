@@ -42,7 +42,10 @@ SSH host...
 * rclone uploads 4 files at a time, retries, and skips archives still being
   written (`*.dat`) and staging directories (`*.tmp`). Backend-specific flags
   are added for the remote's type (for Google Drive: 64 MiB chunks and a stop
-  at the 750 GiB/day upload quota instead of retrying all day).
+  at the 750 GiB/day upload quota instead of retrying all day; for Proton
+  Drive: overwrite the draft a failed upload leaves behind). If rclone stops
+  making progress for 30 minutes it is killed and started again (3 times at
+  most), so a hung transfer cannot block the uploads for days.
 * In mirror mode, if the storage has no backups at all while the remote has
   some, the upload is refused and reported instead of deleting everything
   (typical cause: the disk behind the storage is not mounted).

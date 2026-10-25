@@ -130,8 +130,11 @@ RCLONE_UPLOAD_FLAGS = (
 # only a remote of that type reads them. Google Drive: 64 MiB chunks (~256 MiB
 # of RAM with 4 transfers) and stop at the 750 GiB daily upload quota instead
 # of retrying all day.
+# Proton Drive: a failed upload (Proton often answers 502) leaves a draft that
+# makes every retry of that file fail with "a draft exist": overwrite it.
 RCLONE_TYPE_FLAGS = {
     "drive": ("--drive-chunk-size", "64M", "--drive-stop-on-upload-limit"),
+    "protondrive": ("--protondrive-replace-existing-draft=true",),
 }
 # Backends where rclone can choose between the trash and permanent deletion.
 TRASH_FLAG = {"drive": "--drive-use-trash"}
@@ -1610,6 +1613,33 @@ class UploadResult:
     message: str
     log_tail: str
     seconds: float
+    stalled: bool = False
+
+
+# rclone can hang forever after a failed upload (seen with Proton Drive: no
+# connection open, 0 B/s for a day). It still prints its stats every 5 minutes
+# (--stats 5m): the same byte count STALL_STATS times in a row means stuck.
+STALL_STATS = 6
+STALL_RETRIES = 3
+
+
+class StallWatch:
+    """Fed rclone's output lines, tells when the transferred bytes stop moving."""
+
+    # ponytail: relies on the periodic stats; a hang that stops them goes unseen.
+    def __init__(self) -> None:
+        self.last = ""
+        self.repeats = 0
+
+    def feed(self, line: str) -> bool:
+        # "Transferred:   15.767 GiB / 109.124 GiB, 14%, ..." (bytes), not the
+        # "Transferred:   15 / 57, 26%" line that counts files.
+        head = line.split(",", 1)[0]
+        if not head.startswith("Transferred:") or "B /" not in head:
+            return False
+        self.repeats = self.repeats + 1 if head == self.last else 0
+        self.last = head
+        return self.repeats >= STALL_STATS
 
 
 def build_rclone_command(settings: Settings, dump_dir: Path, kind: str) -> list[str]:
@@ -1648,11 +1678,22 @@ def upload_once(settings: Settings) -> UploadResult:
         log("running " + shlex.join(command))
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         assert process.stdout is not None
+        watch = StallWatch()
         for line in process.stdout:
             sys.stdout.write(line)
             sys.stdout.flush()
             if line.strip():
                 tail.append(line.rstrip())
+            if watch.feed(line):
+                process.terminate()
+                try:
+                    process.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                minutes = STALL_STATS * 5
+                return UploadResult(False, f"rclone stalled: no progress for {minutes} minutes", "\n".join(tail),
+                                    time.monotonic() - started, stalled=True)
         code = process.wait()
         if code != 0:
             raise ToolError(f"rclone exited with code {code}")
@@ -1704,6 +1745,11 @@ def cmd_upload(_args: argparse.Namespace) -> int:
             started = now_iso()
             record_upload({"started": started, "running": True})
             result = upload_once(settings)
+            for _ in range(STALL_RETRIES):
+                if not result.stalled:
+                    break
+                log(f"ERROR: {result.message}: starting it again")
+                result = upload_once(settings)
             record_upload({"started": started, "finished": now_iso(), "ok": result.ok, "message": result.message})
             log(("" if result.ok else "ERROR: ") + result.message)
             notify_result(settings, result)

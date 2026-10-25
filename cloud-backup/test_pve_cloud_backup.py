@@ -61,6 +61,7 @@ def test_backend_flags() -> None:
     proton = tool.build_rclone_command(tool.replace(SETTINGS, mode="mirror"), dump, "protondrive")
     assert proton[1] == "sync"
     assert [flag for flag in proton if flag.startswith("--drive-")] == []
+    assert "--protondrive-replace-existing-draft=true" in proton
     assert proton[-2:] == ["--bwlimit", "30M"]
 
 
@@ -74,6 +75,20 @@ def test_bwlimit_words_mean_no_limit() -> None:
     assert "--bwlimit" not in unlimited
 
 
+def test_stall_watch() -> None:
+    """Fires after STALL_STATS stats with the same bytes; the files line and progress reset nothing wrongly."""
+    stuck = "Transferred:   15.767 GiB / 109.124 GiB, 14%, 0 B/s, ETA -\n"
+    files = "Transferred:           15 / 57, 26%\n"
+    watch = tool.StallWatch()
+    fired = [watch.feed(line) for _ in range(tool.STALL_STATS + 1) for line in (stuck, files)]
+    assert fired.count(True) == 1 and fired[-2] is True
+
+    moving = tool.StallWatch()
+    for gib in range(tool.STALL_STATS * 3):
+        assert not moving.feed(f"Transferred:   {gib}.5 GiB / 109.124 GiB, 14%, 10 MiB/s, ETA 1h\n")
+        assert not moving.feed(files)
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as name:
         test_settings_round_trip(Path(name))
@@ -81,4 +96,5 @@ if __name__ == "__main__":
     test_destination()
     test_backend_flags()
     test_bwlimit_words_mean_no_limit()
+    test_stall_watch()
     print("ok")
