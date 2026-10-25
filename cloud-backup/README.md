@@ -39,6 +39,9 @@ SSH host...
 * The hook only flags a pending upload and starts the service with
   `--no-block`. If another backup job ends while an upload is running, the
   service uploads again right after.
+* Before each upload the service runs `rclone selfupdate --stable`, so the
+  official build always follows the latest stable release (a failed update
+  only logs a warning). A Debian-packaged rclone is left alone.
 * rclone uploads 4 files at a time, retries, and skips archives still being
   written (`*.dat`) and staging directories (`*.tmp`). Backend-specific flags
   are added for the remote's type (for Google Drive: 64 MiB chunks and a stop
@@ -63,8 +66,10 @@ It runs the setup wizard, which installs the tool on the node: afterwards the
 
 The wizard asks, in order:
 
-1. **Prerequisites**: installs `rclone` from the Debian repositories if it is
-   missing.
+1. **Prerequisites**: installs the official `rclone` build from
+   [rclone.org](https://rclone.org/install/) if it is missing, and offers to
+   replace the Debian package (far behind, and it cannot update itself).
+   rclone has no apt repository: the official build updates itself instead.
 2. **Backup storage**: one of the directory storages with backup content of
    this node, showing size and the backup jobs that write to it.
 3. **Remote**: use an rclone remote already configured in
@@ -264,8 +269,13 @@ afterwards:
 * **The provider's own limits apply.** Google Drive: 750 GiB of uploads per day
   per account, and backups in the trash count against the storage quota until
   the trash is emptied (30 days). Proton Drive: uploads are encrypted client
-  side by rclone, so they are slower and CPU-bound. Check rclone's page for the
-  backend ([rclone.org](https://rclone.org/)) for the rest.
+  side by rclone, so they are slower and CPU-bound. It needs rclone 1.75.1 or
+  newer (the official build the setup installs; 1.75.0 writes files Proton's
+  apps cannot open), and until
+  [Proton-API-Bridge#8](https://github.com/rclone/Proton-API-Bridge/pull/8)
+  ships, rclone can hang after a Proton 502: large archives may keep failing.
+  Check rclone's page for the backend ([rclone.org](https://rclone.org/)) for
+  the rest.
 * **The rclone configuration must not be encrypted** (no `rclone config`
   password): the service runs unattended.
 

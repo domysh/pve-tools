@@ -7,9 +7,14 @@ file and the rclone command line.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import os
 import sys
 import tempfile
+import urllib.request
+import zipfile
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location("tool", Path(__file__).with_name("pve_cloud_backup.py"))
@@ -89,10 +94,33 @@ def test_stall_watch() -> None:
         assert not moving.feed(files)
 
 
+def test_install_official_rclone(directory: Path) -> None:
+    """Takes the rclone binary out of the official zip and makes it executable."""
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zip_file:
+        zip_file.writestr("rclone-v9.9.9-linux-amd64/README.txt", "docs")
+        zip_file.writestr("rclone-v9.9.9-linux-amd64/rclone", "binary")
+    urls = []
+
+    def fake_urlopen(request: urllib.request.Request, timeout: int) -> contextlib.AbstractContextManager[io.BytesIO]:
+        assert request.get_header("User-agent") == tool.TOOL_NAME  # the default one gets a 403
+        urls.append(request.full_url)
+        return contextlib.nullcontext(io.BytesIO(archive.getvalue()))
+
+    tool.urllib.request.urlopen = fake_urlopen
+    tool.RCLONE_ARCHES = {os.uname().machine: "amd64"}
+    tool.RCLONE_PATH = directory / "rclone"
+    tool.install_official_rclone()
+    assert urls == ["https://downloads.rclone.org/rclone-current-linux-amd64.zip"]
+    assert tool.RCLONE_PATH.read_text() == "binary"
+    assert os.access(tool.RCLONE_PATH, os.X_OK)
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as name:
         test_settings_round_trip(Path(name))
         test_legacy_config_is_read(Path(name))
+        test_install_official_rclone(Path(name))
     test_destination()
     test_backend_flags()
     test_bwlimit_words_mean_no_limit()

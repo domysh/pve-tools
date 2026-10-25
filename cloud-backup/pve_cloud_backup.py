@@ -65,6 +65,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -115,6 +116,12 @@ DRIVE_SCOPES = {
     "drive.file": "https://www.googleapis.com/auth/drive.file",
     "drive": "https://www.googleapis.com/auth/drive",
 }
+
+# Official rclone builds: the Debian package is far behind (providers such as
+# Proton Drive need recent fixes) and is built without "rclone selfupdate".
+RCLONE_ZIP_URL = "https://downloads.rclone.org/rclone-current-linux-{arch}.zip"
+RCLONE_ARCHES = {"x86_64": "amd64", "aarch64": "arm64"}
+RCLONE_PATH = Path("/usr/bin/rclone")
 
 # 4 parallel uploads, retried; --fast-list is ignored by backends without it.
 RCLONE_UPLOAD_FLAGS = (
@@ -855,22 +862,80 @@ def show_file_head(path: Path, lines: int = 20) -> None:
 STEPS = 6
 
 
+def rclone_packaged() -> bool:
+    """True when rclone comes from a Debian package (old, cannot update itself)."""
+    path = shutil.which("rclone")
+    return bool(path) and subprocess.run(["dpkg", "-S", os.path.realpath(path)], capture_output=True).returncode == 0
+
+
+def install_official_rclone() -> None:
+    arch = RCLONE_ARCHES.get(os.uname().machine)
+    if not arch:
+        raise ToolError(f"no official rclone build for {os.uname().machine}: install rclone by hand")
+    url = RCLONE_ZIP_URL.format(arch=arch)
+    print(f"==> downloading {url}")
+    try:
+        # downloads.rclone.org answers 403 to Python's default User-Agent.
+        request = urllib.request.Request(url, headers={"User-Agent": TOOL_NAME})
+        with urllib.request.urlopen(request, timeout=300) as response:
+            archive = zipfile.ZipFile(io.BytesIO(response.read()))
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ToolError(f"cannot download rclone: {exc}") from exc
+    member = next((name for name in archive.namelist() if name.endswith("/rclone")), None)
+    if not member:
+        raise ToolError(f"{url} has no rclone binary")
+    temporary = RCLONE_PATH.with_name(".rclone.new")
+    temporary.write_bytes(archive.read(member))
+    temporary.chmod(0o755)
+    temporary.replace(RCLONE_PATH)
+
+
+def update_rclone() -> None:
+    """Move to the latest stable rclone before an upload; a failure only warns."""
+    # ponytail: follows every stable release, a broken one lands too (1.75.0 did
+    # for Proton Drive); add a pin setting if that bites.
+    if not shutil.which("rclone") or rclone_packaged():
+        return
+    try:
+        result = subprocess.run(["rclone", "selfupdate", "--stable"], capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"WARNING: cannot update rclone: {exc}")
+        return
+    for line in (result.stdout + result.stderr).splitlines():
+        log(f"rclone selfupdate: {line}")
+    if result.returncode != 0:
+        log("WARNING: cannot update rclone: uploading with the installed version")
+
+
 def step_prerequisites() -> None:
     heading(f"Step 1/{STEPS} - Prerequisites")
-    if shutil.which("rclone"):
+    if shutil.which("rclone") and not rclone_packaged():
         print(f"rclone: {run(['rclone', 'version']).splitlines()[0]} ({shutil.which('rclone')})")
+        print("It is updated to the latest stable release before every upload.")
         return
-    paragraph(
-        """
-        rclone is not installed. It does the actual transfers (resumable,
-        checksummed, retried) and talks to every provider.
-        """
-    )
-    if not ask_yes_no("Install it from the Debian repositories (apt-get install rclone)?", True):
-        raise ToolError("rclone is required")
-    for command in (["apt-get", "update"], ["apt-get", "install", "-y", "rclone"]):
-        if subprocess.run(command, check=False).returncode != 0:
-            raise ToolError(f"{shlex.join(command)} failed")
+    if shutil.which("rclone"):
+        paragraph(
+            """
+            rclone comes from the Debian repositories: that version is far
+            behind (providers such as Proton Drive need recent fixes) and
+            cannot update itself.
+            """
+        )
+        if not ask_yes_no("Replace it with the official build from rclone.org, updated before every upload?", True):
+            print("Keeping the Debian rclone: it will not be updated.")
+            return
+        if subprocess.run(["apt-get", "remove", "-y", "rclone"], check=False).returncode != 0:
+            raise ToolError("apt-get remove -y rclone failed")
+    else:
+        paragraph(
+            """
+            rclone is not installed. It does the actual transfers (resumable,
+            checksummed, retried) and talks to every provider.
+            """
+        )
+        if not ask_yes_no("Install the official build from rclone.org, updated before every upload?", True):
+            raise ToolError("rclone is required")
+    install_official_rclone()
     print(f"\nrclone: {run(['rclone', 'version']).splitlines()[0]}")
 
 
@@ -1739,6 +1804,7 @@ def cmd_upload(_args: argparse.Namespace) -> int:
             PENDING_FLAG.touch()
             log("another upload is running: it will upload again when done")
             return 0
+        update_rclone()
         failed = False
         while True:
             PENDING_FLAG.unlink(missing_ok=True)
