@@ -169,8 +169,14 @@ class Node:
         """Run a bash script on this node (locally or over the cluster's SSH)."""
         if self.is_local:
             return run(["bash", "-s"], input_text=script)
+        # Like PVE::SSHInfo: cluster host keys are stored under the node name,
+        # not the address, in a per-node known_hosts file (PVE 8.1+).
+        options = ["-o", "BatchMode=yes", "-o", f"HostKeyAlias={self.name}"]
+        known_hosts = Path(f"/etc/pve/nodes/{self.name}/ssh_known_hosts")
+        if known_hosts.is_file():
+            options += ["-o", f"UserKnownHostsFile={known_hosts}", "-o", "GlobalKnownHostsFile=none"]
         target = f"root@{self.address or self.name}"
-        return run(["ssh", "-o", "BatchMode=yes", target, "bash", "-s"], input_text=script)
+        return run(["ssh", *options, target, "bash", "-s"], input_text=script)
 
 
 def local_node_name() -> str:
