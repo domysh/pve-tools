@@ -143,6 +143,9 @@ Every setting can be changed interactively or given as an option of
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--zone`, `--vnet` | `isolated`, `isonet` | SDN ids (2-8 lowercase letters and digits) |
+| `--cross-node` | `no` | `yes`: VXLAN tunnels between the nodes, guests on different nodes share the vnet |
+| `--vni` | `auto` | VXLAN identifier of the tunnels, a free one from 100000 |
+| `--isolation` | `yes` | `no`: keep the internet access (NAT) but drop the LAN/VPN blocking |
 | `--subnet4` | `auto` | first free `/22` from `10.100.0.0` (`--subnet4-auto-prefix-len` sets the size) |
 | `--subnet6` | `auto` | random RFC 4193 ULA `/48`, subnet 1 as `/64` |
 | `--dns4`, `--dns6` | empty | empty = the gateway (dnsmasq forwards to the node's resolvers) |
@@ -227,9 +230,42 @@ guest still uses the vnet.
 
 ## Notes and limits
 
-* **Simple zones are node-local layer 2.** Guests keep their addresses when
-  migrated, but guests on *different* nodes cannot talk to each other directly.
-  That would need an EVPN zone, for which Proxmox does not implement DHCP yet.
+* **Simple zones are node-local layer 2**, unless `--cross-node yes`.
+* **Isolation off (`--isolation no`).** Only MASQUERADE stays in the agent's
+  table: guests reach the internet and the LAN, and no input or forward filter
+  is installed. Changeable at any time; the agent picks it up on the next resync.
+
+## Cross-node traffic
+
+With `--cross-node yes` guests on different nodes share the vnet, as if it were
+one switch. The zone stays a Simple zone, so DHCP and the IPAM keep working
+(Proxmox's VXLAN zones have no DHCP). On every node the agent:
+
+* plugs a VXLAN device `vx<vnet>` into the vnet bridge, with every other
+  node's cluster address (from `/etc/pve/.members`) as a unicast peer: nodes
+  added to the cluster are picked up without running `install` again;
+* drops, in table `bridge isolated_net`, everything the node itself sends into
+  the tunnel. The vnet has the same gateway IP and MAC on every node, so each
+  guest only ever hears the gateway, DHCP, DNS and router advertisements of
+  the node it runs on, and its internet traffic leaves from that node.
+
+It can be turned on or off at any time with `install --cross-node yes|no`.
+Things to know:
+
+* the nodes must reach each other on UDP 4789 (open it if the PVE firewall is
+  enabled on the hosts);
+* VXLAN adds 50 bytes; full-size frames are fragmented on a 1500-byte
+  underlay. It works, but a larger underlay MTU (or a smaller guest MTU) is
+  faster;
+* port forwards (DNAT) must be on the node that runs the guest, and
+  connections through the NAT are reset when a guest migrates (its gateway
+  becomes the new node);
+* not yet verified on a real cluster: test it before relying on it.
+
+```bash
+ip -d link show vx<vnet>              # the tunnel device
+bridge fdb show dev vx<vnet>          # one 00:00:00:00:00:00 entry per peer
+```
 * **ULA and address selection.** Per RFC 6724 most OSes prefer IPv4 over a
   ULA source when the destination is a global IPv6 address, so dual-stack
   guests will use IPv4 for most internet traffic. That is expected; IPv6 works

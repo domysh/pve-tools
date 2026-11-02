@@ -8,11 +8,14 @@ What it builds
 * A Simple SDN zone using the built-in PVE IPAM and the dnsmasq DHCP backend.
   The IPAM lives in /etc/pve, so every address is unique cluster-wide and is
   bound to the guest's MAC address: a guest keeps its IPv4/IPv6 addresses when
-  it is migrated, and the anycast gateway exists on every node.
+  it is migrated, and the anycast gateway exists on every node. With
+  CROSS_NODE=yes the agent joins the nodes' vnet bridges with VXLAN tunnels,
+  so guests on different nodes share one segment.
 * One vnet with an IPv4 subnet and a ULA IPv6 subnet, both served by DHCP
   (DHCPv4, DHCPv6 + router advertisements).
-* isolated-net-agent on every node: MASQUERADE for both families and a
-  blocklist derived from the node's routing table (see the agent docstring).
+* isolated-net-agent on every node: MASQUERADE for both families and, unless
+  ISOLATION=no, a blocklist derived from the node's routing table (see the
+  agent docstring).
 
 Why SDN's own SNAT option is *not* used
 ---------------------------------------
@@ -76,6 +79,7 @@ DHCP_V4_FIRST_OFFSET = 10
 DHCP_V6_FIRST_OFFSET = 0x1000
 DHCP_V6_LAST_OFFSET = 0xFFFF
 SDN_APPLY_TIMEOUT_SECONDS = 300
+VXLAN_FIRST_VNI = 100000
 
 
 class DeployError(RuntimeError):
@@ -228,6 +232,9 @@ SETTINGS = {
     "SUBNET6": ("auto", "CIDR", "IPv6 subnet, or auto for a random unique local /64"),
     "DNS4": ("", "IP", "IPv4 DNS server announced via DHCP, empty for the gateway"),
     "DNS6": ("", "IP", "IPv6 DNS server announced via DHCP, empty for the gateway"),
+    "CROSS_NODE": ("no", "yes|no", "guests on different nodes share the vnet (VXLAN tunnels between the nodes)"),
+    "VNI": ("auto", "N", "VXLAN identifier of the tunnels, auto picks a free one from 100000"),
+    "ISOLATION": ("yes", "yes|no", "block LAN, VPNs and other bridges (yes), or only NAT them (no)"),
     "SITE_PREFIX_LEN6": ("48", "N", "also block the enclosing /N of on-link global IPv6 prefixes, 0 disables it"),
     "EXTRA_BLOCKED": ("", "CIDRS", "more networks guests must never reach, comma separated"),
 }
@@ -236,7 +243,18 @@ FIXED_SETTINGS = ("ZONE", "VNET", "SUBNET4", "SUBNET6")
 # Only used to create the SDN objects: later changes go through the web UI.
 CREATION_SETTINGS = ("VNET_ALIAS", "SUBNET4_AUTO_PREFIX_LEN", "DNS4", "DNS6")
 # Asked when changing the settings interactively; the others are options only.
-ASKED_SETTINGS = ("ZONE", "VNET", "SUBNET4", "SUBNET6", "DNS4", "DNS6", "SITE_PREFIX_LEN6", "EXTRA_BLOCKED")
+ASKED_SETTINGS = (
+    "ZONE",
+    "VNET",
+    "SUBNET4",
+    "SUBNET6",
+    "DNS4",
+    "DNS6",
+    "CROSS_NODE",
+    "ISOLATION",
+    "SITE_PREFIX_LEN6",
+    "EXTRA_BLOCKED",
+)
 CLEARABLE_SETTINGS = ("DNS4", "DNS6", "EXTRA_BLOCKED")
 
 
@@ -256,6 +274,9 @@ class Settings:
     subnet6: ipaddress.IPv6Network | None  # None means "auto"
     dns4: ipaddress.IPv4Address | None
     dns6: ipaddress.IPv6Address | None
+    cross_node: bool
+    vni: int | None  # None means "auto"
+    isolation: bool
     site_prefix_len6: int
     extra_blocked: tuple[IPNetwork, ...]
 
@@ -304,6 +325,14 @@ class Settings:
                 raise DeployError(f"{key} must be between {low} and {high}")
             return number
 
+        def yes_no(key: str) -> bool:
+            value = get(key).lower()
+            if value not in ("yes", "no"):
+                raise DeployError(f"{key} must be yes or no")
+            return value == "yes"
+
+        vni = None if get("VNI").lower() == "auto" else integer("VNI", 1, 16777215)
+
         subnet4 = optional_network("SUBNET4", 4)
         if subnet4 is not None and subnet4.prefixlen > 29:
             raise DeployError("SUBNET4 must be /29 or larger")
@@ -327,6 +356,9 @@ class Settings:
             subnet6=subnet6,
             dns4=optional_address("DNS4", 4),
             dns6=optional_address("DNS6", 6),
+            cross_node=yes_no("CROSS_NODE"),
+            vni=vni,
+            isolation=yes_no("ISOLATION"),
             site_prefix_len6=integer("SITE_PREFIX_LEN6", 0, 64),
             extra_blocked=tuple(extra),
         )
@@ -393,9 +425,13 @@ def review_settings(values: dict[str, str], deployed: bool, nodes: Sequence[Node
         ]
         if not deployed:
             rows.append(("DNS servers", f"IPv4 {settings.dns4 or 'gateway'}, IPv6 {settings.dns6 or 'gateway'}"))
-        site = settings.site_prefix_len6
-        rows.append(("IPv6 site block", f"the /{site} around each on-link global prefix" if site else "off"))
-        rows.append(("Extra blocked", ", ".join(str(network) for network in settings.extra_blocked) or "none"))
+        vni = settings.vni or "auto"
+        rows.append(("Cross-node", f"yes, VXLAN tunnels between the nodes (VNI {vni})" if settings.cross_node else "no"))
+        rows.append(("Isolation", "yes" if settings.isolation else "no, guests reach LAN and VPNs (NAT stays)"))
+        if settings.isolation:
+            site = settings.site_prefix_len6
+            rows.append(("IPv6 site block", f"the /{site} around each on-link global prefix" if site else "off"))
+            rows.append(("Extra blocked", ", ".join(str(network) for network in settings.extra_blocked) or "none"))
         for label, value in rows:
             print(f"  {label + ':':<17}{value}")
         print(
@@ -548,6 +584,18 @@ def ensure_vnet(settings: Settings) -> None:
     log(f"vnet {settings.vnet} already present")
 
 
+def free_vni() -> int:
+    """Return the first VXLAN identifier, from 100000 up, that no SDN vnet uses as tag.
+
+    Chosen once and recorded in the shared config, like the auto subnets.
+    """
+    used = {int(entry["tag"]) for entry in pvesh("get", "/cluster/sdn/vnets") or [] if entry.get("tag") is not None}
+    for candidate in range(VXLAN_FIRST_VNI, 16777216):
+        if candidate not in used:
+            return candidate
+    raise DeployError("no free VXLAN identifier, choose one with --vni")
+
+
 def ensure_subnets(settings: Settings, nodes: Sequence[Node]) -> tuple[IPNetwork, IPNetwork]:
     """Make sure the vnet has exactly one IPv4 and one IPv6 subnet with DHCP."""
     path = f"/cluster/sdn/vnets/{settings.vnet}/subnets"
@@ -692,7 +740,7 @@ echo "agent removed"
 """
 
 
-def write_shared_config(settings: Settings, subnet4: IPNetwork, subnet6: IPNetwork) -> None:
+def write_shared_config(settings: Settings, subnet4: IPNetwork, subnet6: IPNetwork, vni: int | None) -> None:
     """Record the resolved settings in pmxcfs, where every node's agent reads them."""
     extra = " ".join(str(network) for network in settings.extra_blocked)
     timestamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
@@ -705,6 +753,9 @@ ZONE={settings.zone}
 VNET={settings.vnet}
 SUBNET4={subnet4}
 SUBNET6={subnet6}
+CROSS_NODE={'yes' if settings.cross_node else 'no'}
+VNI={vni or 'auto'}
+ISOLATION={'yes' if settings.isolation else 'no'}
 SITE_PREFIX_LEN6={settings.site_prefix_len6}
 EXTRA_BLOCKED="{extra}"
 """
@@ -749,7 +800,8 @@ def cmd_install(args: argparse.Namespace) -> None:
     ensure_zone(settings)
     ensure_vnet(settings)
     subnet4, subnet6 = ensure_subnets(settings, nodes)
-    write_shared_config(settings, subnet4, subnet6)
+    vni = settings.vni if settings.vni is not None or not settings.cross_node else free_vni()
+    write_shared_config(settings, subnet4, subnet6, vni)
 
     for node in nodes:
         log(f"[{node.name}] installing {SERVICE_NAME}")
@@ -769,6 +821,7 @@ def cmd_install(args: argparse.Namespace) -> None:
     print(f"Isolated network ready: attach guests to bridge={settings.vnet}")
     print(f"  IPv4 {subnet4}  gateway {subnet4.network_address + 1}")
     print(f"  IPv6 {subnet6}  gateway {subnet6.network_address + 1}")
+    print(f"  cross-node {'yes' if settings.cross_node else 'no'}, isolation {'yes' if settings.isolation else 'no'}")
     print("  VMs: DHCP on both families.  LXC: ip=dhcp,ip6=dhcp.")
 
 
@@ -778,6 +831,7 @@ def cmd_status(_args: argparse.Namespace) -> None:
     config = parse_key_value_file(SHARED_CONFIG_PATH)
     zone, vnet = config.get("ZONE", ""), config.get("VNET", "")
     print(f"zone {zone}, vnet {vnet}, IPv4 {config.get('SUBNET4')}, IPv6 {config.get('SUBNET6')}")
+    print(f"cross-node {config.get('CROSS_NODE', 'no')}, isolation {config.get('ISOLATION', 'yes')}")
     print(f"pending SDN changes: {'yes' if has_pending_sdn_changes() else 'no'}")
 
     for node in cluster_nodes():

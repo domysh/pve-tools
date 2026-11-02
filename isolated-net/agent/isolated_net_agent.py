@@ -29,6 +29,14 @@ treated as "local" and rejected. On top of that come:
 All of this is recomputed on every route/link/address change, so nothing
 depends on the current LAN addressing.
 
+With ``ISOLATION=no`` the blocklist, the input filter and the anti-spoofing
+are not rendered: the vnets keep MASQUERADE to the internet but may reach the
+LAN and everything else the node can route to.
+
+With ``CROSS_NODE=yes`` the vnet bridges of all nodes are joined by VXLAN
+tunnels (see "Cross-node tunnels" below), while each guest keeps using the
+gateway, DHCP and DNS of the node it runs on.
+
 Guests with another uplink
 --------------------------
 The SDN dnsmasq announces the vnet gateway as a default router. A guest that
@@ -76,9 +84,14 @@ DNSMASQ_DROPIN_NAME = "90-isolated-net.conf"
 LEASE_OWNERS_PATH = Path("/var/lib/isolated-net-agent/lease-owners.json")
 IPV6_CONF_ROOT = Path("/proc/sys/net/ipv6/conf")
 IPV4_FORWARD_PATH = Path("/proc/sys/net/ipv4/ip_forward")
+CLUSTER_MEMBERS_PATH = Path("/etc/pve/.members")
 
 NFT_FAMILY = "inet"
 NFT_TABLE = "isolated_net"
+
+VXLAN_UDP_PORT = 4789
+# Marks the VXLAN devices the agent owns, so it never touches anyone else's.
+VXLAN_ALIAS = "isolated-net-agent"
 
 # A full resync runs at least this often, even without netlink events, to pick
 # up SDN applies and shared-config edits (pmxcfs does not support inotify).
@@ -168,15 +181,35 @@ class AgentConfig:
     """Settings the agent needs; a subset of the deploy configuration."""
 
     zones: frozenset[str]
+    isolation: bool
     site_prefix_len6: int
     extra_blocked: tuple[IPNetwork, ...]
+    # VXLAN tunnels to the other nodes for this vnet; None when CROSS_NODE=no.
+    cross_node_vnet: str | None = None
+    vni: int = 0
 
     @classmethod
     def load(cls, path: Path) -> "AgentConfig":
         """Load the shared config, or return an empty config if it is missing."""
         if not path.exists():
-            return cls(zones=frozenset(), site_prefix_len6=0, extra_blocked=())
+            return cls(zones=frozenset(), isolation=True, site_prefix_len6=0, extra_blocked=())
         values = parse_key_value_file(path)
+
+        def yes_no(key: str, default: str) -> bool:
+            value = values.get(key, default).lower()
+            if value not in ("yes", "no"):
+                raise AgentError(f"{key} must be yes or no, got {value!r}")
+            return value == "yes"
+
+        cross_node_vnet, vni = None, 0
+        if yes_no("CROSS_NODE", "no"):
+            cross_node_vnet = values.get("VNET", "")
+            try:
+                vni = int(values.get("VNI", ""))
+            except ValueError as exc:
+                raise AgentError(f"CROSS_NODE=yes needs a numeric VNI, got {values.get('VNI')!r}") from exc
+            if not cross_node_vnet or not 1 <= vni <= 16777215:
+                raise AgentError("CROSS_NODE=yes needs VNET and a VNI between 1 and 16777215")
 
         raw_site_len = values.get("SITE_PREFIX_LEN6", str(DEFAULT_SITE_PREFIX_LEN6))
         try:
@@ -195,8 +228,11 @@ class AgentConfig:
 
         return cls(
             zones=frozenset(split_list(values.get("ZONE", ""))),
+            isolation=yes_no("ISOLATION", "yes"),
             site_prefix_len6=site_prefix_len6,
             extra_blocked=tuple(extra),
+            cross_node_vnet=cross_node_vnet,
+            vni=vni,
         )
 
 
@@ -429,8 +465,17 @@ def render_ruleset(
     topology: Topology,
     blocked_v4: Sequence[IPNetwork],
     blocked_v6: Sequence[IPNetwork],
+    isolate: bool = True,
+    vxlan_device: str | None = None,
 ) -> str:
-    """Render the complete, self-replacing nftables table.
+    """Render the complete, self-replacing nftables tables.
+
+    With ``isolate`` False only NAT is rendered: the vnets still reach the
+    internet, but nothing is filtered, blocked or spoof-checked. With a
+    ``vxlan_device`` a bridge table keeps everything the node itself sends
+    (gateway, DHCP, router advertisements) out of the tunnels to the other
+    nodes: every node has the same gateway IP and MAC on the vnet, so each
+    guest must only ever hear the node it runs on.
 
     The leading ``table``/``delete table`` pair makes ``nft -f`` replace the
     table in one atomic transaction whether or not it already exists, so no
@@ -438,31 +483,21 @@ def render_ruleset(
     because conntrack state lives outside the table.
     """
     vnet_elements = [f'"{name}"' for name in sorted(topology.vnets)]
-    sets = "\n\n".join(
-        [
-            nft_set("isolated_ifaces", "ifname", vnet_elements, interval=False),
-            nft_set("internal_v4", "ipv4_addr", [str(n) for n in topology.internal_v4], interval=True),
-            nft_set("internal_v6", "ipv6_addr", [str(n) for n in topology.internal_v6], interval=True),
+    set_definitions = [
+        nft_set("isolated_ifaces", "ifname", vnet_elements, interval=False),
+        nft_set("internal_v4", "ipv4_addr", [str(n) for n in topology.internal_v4], interval=True),
+        nft_set("internal_v6", "ipv6_addr", [str(n) for n in topology.internal_v6], interval=True),
+    ]
+    if isolate:
+        set_definitions += [
             nft_set("blocked_v4", "ipv4_addr", [str(n) for n in blocked_v4], interval=True),
             nft_set("blocked_v6", "ipv6_addr", [str(n) for n in blocked_v6], interval=True),
         ]
-    )
+    sets = "\n\n".join(set_definitions)
 
-    return f"""\
-table {NFT_FAMILY} {NFT_TABLE}
-delete table {NFT_FAMILY} {NFT_TABLE}
-
-table {NFT_FAMILY} {NFT_TABLE} {{
-\tcomment "managed by isolated-net-agent, do not edit"
-
-{sets}
-
-\t# See FIREWALL_BRIDGE_CT_ZONE in the agent source for the rationale.
-\tchain raw_prerouting {{
-\t\ttype filter hook prerouting priority raw; policy accept;
-\t\tiifname "fwbr*" ct zone set {FIREWALL_BRIDGE_CT_ZONE}
-\t}}
-
+    filter_chains = ""
+    if isolate:
+        filter_chains = f"""\
 \t# Guests may only use the gateway for DHCP, router advertisements/NDP,
 \t# ICMP and DNS (dnsmasq forwards to the node's own resolvers).
 \tchain input {{
@@ -477,14 +512,6 @@ table {NFT_FAMILY} {NFT_TABLE} {{
 \t\tudp dport {{ 67, 547 }} accept
 \t\tmeta l4proto {{ tcp, udp }} th dport 53 accept
 \t\tcounter reject with icmpx admin-prohibited
-\t}}
-
-\t# Clamp TCP MSS to the route MTU (e.g. PPPoE uplinks), since guests are
-\t# told the vnet MTU and path MTU discovery is often broken on the internet.
-\tchain forward_mangle {{
-\t\ttype filter hook forward priority mangle; policy accept;
-\t\tiifname @isolated_ifaces tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
-\t\toifname @isolated_ifaces tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
 \t}}
 
 \tchain forward {{
@@ -522,7 +549,47 @@ table {NFT_FAMILY} {NFT_TABLE} {{
 \t\tct status dnat accept
 \t\tcounter reject with icmpx admin-prohibited
 \t}}
+"""
 
+    bridge_table = ""
+    if vxlan_device:
+        bridge_table = f"""
+table bridge {NFT_TABLE} {{
+\tcomment "managed by isolated-net-agent, do not edit"
+
+\tchain output {{
+\t\ttype filter hook output priority filter; policy accept;
+\t\toifname "{vxlan_device}" drop
+\t}}
+}}
+"""
+
+    return f"""\
+table {NFT_FAMILY} {NFT_TABLE}
+delete table {NFT_FAMILY} {NFT_TABLE}
+table bridge {NFT_TABLE}
+delete table bridge {NFT_TABLE}
+{bridge_table}
+table {NFT_FAMILY} {NFT_TABLE} {{
+\tcomment "managed by isolated-net-agent, do not edit"
+
+{sets}
+
+\t# See FIREWALL_BRIDGE_CT_ZONE in the agent source for the rationale.
+\tchain raw_prerouting {{
+\t\ttype filter hook prerouting priority raw; policy accept;
+\t\tiifname "fwbr*" ct zone set {FIREWALL_BRIDGE_CT_ZONE}
+\t}}
+
+\t# Clamp TCP MSS to the route MTU (e.g. PPPoE uplinks), since guests are
+\t# told the vnet MTU and path MTU discovery is often broken on the internet.
+\tchain forward_mangle {{
+\t\ttype filter hook forward priority mangle; policy accept;
+\t\tiifname @isolated_ifaces tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
+\t\toifname @isolated_ifaces tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
+\t}}
+
+{filter_chains}
 \t# MASQUERADE (not SNAT) so the source follows the current uplink address.
 \tchain postrouting {{
 \t\ttype nat hook postrouting priority srcnat; policy accept;
@@ -548,7 +615,8 @@ def nft_apply(ruleset: str) -> None:
 
 
 def nft_delete_table() -> bool:
-    """Remove the managed table; return True if it existed."""
+    """Remove the managed tables; return True if the main one existed."""
+    subprocess.run(["nft", "delete", "table", "bridge", NFT_TABLE], capture_output=True, check=False)
     if not nft_table_exists():
         return False
     run_command(["nft", "delete", "table", NFT_FAMILY, NFT_TABLE])
@@ -857,6 +925,115 @@ def clean_stale_leases(zones: Iterable[str]) -> None:
 
 
 # --------------------------------------------------------------------------
+# Cross-node tunnels
+# --------------------------------------------------------------------------
+#
+# A Simple zone vnet is a bridge without ports on every node. With
+# CROSS_NODE=yes the agent plugs a VXLAN device into it on each node, with
+# one all-zero FDB entry per other node so broadcasts reach all of them
+# (unicast head-end replication, no multicast or BGP needed); unicast MACs are
+# learned as usual. The peers come from pmxcfs's member list, so a node added
+# to the cluster is picked up without re-running install. ifreload (every SDN
+# apply) unplugs unknown ports from the bridge; the link event makes the agent
+# plug it back within a second.
+#
+# VXLAN leaves the outer DF bit unset, so a full-size guest frame is
+# fragmented on a 1500-byte underlay instead of lost: it works out of the box,
+# and a larger underlay MTU avoids the fragmentation.
+
+
+def vxlan_device_name(vnet: str) -> str:
+    """vx<vnet>: vnet ids have at most 8 characters, well below IFNAMSIZ."""
+    return f"vx{vnet}"
+
+
+def read_cluster_addresses(path: Path = CLUSTER_MEMBERS_PATH) -> tuple[str | None, list[str]]:
+    """Return this node's cluster address and those of the other nodes (online or not)."""
+    try:
+        members = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None, []
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AgentError(f"cannot read {path}: {exc}") from exc
+    local = members.get("nodename")
+    nodes = members.get("nodelist") or {}
+    peers = sorted(info["ip"] for name, info in nodes.items() if name != local and info.get("ip"))
+    return (nodes.get(local) or {}).get("ip"), peers
+
+
+def link_details(device: str) -> dict | None:
+    """Return ``ip -d link`` details of a device, None if it does not exist."""
+    result = subprocess.run(
+        ["ip", "-j", "-d", "link", "show", "dev", device], capture_output=True, text=True, check=False
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    links = json.loads(result.stdout)
+    return links[0] if links else None
+
+
+def ensure_vxlan_device(device: str, bridge: str, vni: int, local: str | None) -> bool:
+    """Create the VXLAN device and plug it into the bridge; False if the bridge is missing."""
+    bridge_details = link_details(bridge)
+    if bridge_details is None:
+        return False  # SDN not applied on this node yet
+
+    details = link_details(device)
+    data = ((details or {}).get("linkinfo") or {}).get("info_data") or {}
+    if details is not None and (data.get("id"), data.get("local"), data.get("port")) != (vni, local, VXLAN_UDP_PORT):
+        run_command(["ip", "link", "del", device])
+        LOG.info("removed %s: VNI or local address changed", device)
+        details = None
+    if details is None:
+        command = ["ip", "link", "add", device, "type", "vxlan", "id", str(vni), "dstport", str(VXLAN_UDP_PORT)]
+        if local:
+            command += ["local", local]
+        run_command(command)
+        run_command(["ip", "link", "set", "dev", device, "alias", VXLAN_ALIAS])
+        LOG.info("created %s (VNI %d, local %s)", device, vni, local or "auto")
+        details = link_details(device) or {}
+
+    mtu = bridge_details.get("mtu")
+    if details.get("master") != bridge or details.get("mtu") != mtu or "UP" not in details.get("flags", []):
+        run_command(["ip", "link", "set", "dev", device, "mtu", str(mtu), "master", bridge, "up"])
+        LOG.info("plugged %s into %s (mtu %s)", device, bridge, mtu)
+    return True
+
+
+def sync_flood_entries(device: str, peers: Sequence[str]) -> None:
+    """Keep exactly one all-zero FDB entry per peer on the VXLAN device."""
+    entries = json.loads(run_command(["bridge", "-j", "fdb", "show", "dev", device]) or "[]")
+    current = {entry["dst"] for entry in entries if entry.get("mac") == "00:00:00:00:00:00" and entry.get("dst")}
+    for peer in sorted(set(peers) - current):
+        run_command(["bridge", "fdb", "append", "00:00:00:00:00:00", "dev", device, "dst", peer])
+        LOG.info("%s: added peer %s", device, peer)
+    for peer in sorted(current - set(peers)):
+        run_command(["bridge", "fdb", "del", "00:00:00:00:00:00", "dev", device, "dst", peer])
+        LOG.info("%s: removed peer %s", device, peer)
+
+
+def remove_vxlan_devices(keep: str | None = None) -> None:
+    """Delete the agent's VXLAN devices except ``keep``."""
+    links = json.loads(run_command(["ip", "-j", "link", "show", "type", "vxlan"]) or "[]")
+    for link in links:
+        if link.get("ifalias") == VXLAN_ALIAS and link.get("ifname") != keep:
+            run_command(["ip", "link", "del", link["ifname"]])
+            LOG.info("removed %s", link["ifname"])
+
+
+def sync_vxlan(config: AgentConfig) -> None:
+    """Converge the tunnels to the other nodes with CROSS_NODE."""
+    if config.cross_node_vnet is None:
+        remove_vxlan_devices()
+        return
+    device = vxlan_device_name(config.cross_node_vnet)
+    remove_vxlan_devices(keep=device)
+    local, peers = read_cluster_addresses()
+    if ensure_vxlan_device(device, config.cross_node_vnet, config.vni, local):
+        sync_flood_entries(device, peers)
+
+
+# --------------------------------------------------------------------------
 # Agent
 # --------------------------------------------------------------------------
 
@@ -882,11 +1059,16 @@ def compute_desired_state(config_path: Path) -> DesiredState:
     routes_v4 = read_routes(4)
     routes_v6 = read_routes(6)
     uplinks = default_route_devices(routes_v4) | default_route_devices(routes_v6)
-    ruleset = render_ruleset(
-        topology,
-        compute_blocked(4, routes_v4, topology, config),
-        compute_blocked(6, routes_v6, topology, config),
-    )
+    vxlan_device = vxlan_device_name(config.cross_node_vnet) if config.cross_node_vnet else None
+    if config.isolation:
+        ruleset = render_ruleset(
+            topology,
+            compute_blocked(4, routes_v4, topology, config),
+            compute_blocked(6, routes_v6, topology, config),
+            vxlan_device=vxlan_device,
+        )
+    else:
+        ruleset = render_ruleset(topology, (), (), isolate=False, vxlan_device=vxlan_device)
     return DesiredState(config, topology, uplinks, ruleset, render_dnsmasq_dropins(topology))
 
 
@@ -909,10 +1091,13 @@ class Agent:
                 LOG.info("no isolated zone configured: removed table %s", NFT_TABLE)
             self.applied_digest = None
             remove_dnsmasq_dropins()
+            remove_vxlan_devices()
             return
 
         ensure_kernel_settings(state.uplinks, state.topology.vnets)
+        # The ruleset first: it keeps the gateway out of the tunnels.
         self.sync_ruleset(state)
+        sync_vxlan(state.config)
 
         # The router preference and the lease hygiene are best effort and
         # must never block NAT/isolation.
@@ -1086,6 +1271,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             removed = nft_delete_table()
             LOG.info("table %s %s", NFT_TABLE, "removed" if removed else "was not loaded")
             remove_dnsmasq_dropins()
+            remove_vxlan_devices()
         elif args.command == "sync":
             Agent(args.config).sync()
         else:
