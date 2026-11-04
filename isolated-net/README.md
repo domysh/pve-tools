@@ -254,9 +254,12 @@ Things to know:
 
 * the nodes must reach each other on UDP 4789 (open it if the PVE firewall is
   enabled on the hosts);
-* VXLAN adds 50 bytes; full-size frames are fragmented on a 1500-byte
-  underlay. It works, but a larger underlay MTU (or a smaller guest MTU) is
-  faster;
+* VXLAN adds 50 bytes, so `install` sets the zone MTU to the smallest MTU of
+  the nodes' cluster interfaces minus 50 (1450 on a 1500-byte network; nothing
+  when the underlay carries 1550 or more). Proxmox passes it to the bridge,
+  DHCP, router advertisements, LXC veths and virtio NICs; **running guests
+  pick it up when restarted**. An MTU you set on the zone yourself is left
+  alone, and turning cross-node off removes the one `install` set;
 * port forwards (DNAT) must be on the node that runs the guest, and
   connections through the NAT are reset when a guest migrates (its gateway
   becomes the new node);

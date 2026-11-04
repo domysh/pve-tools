@@ -80,6 +80,7 @@ DHCP_V6_FIRST_OFFSET = 0x1000
 DHCP_V6_LAST_OFFSET = 0xFFFF
 SDN_APPLY_TIMEOUT_SECONDS = 300
 VXLAN_FIRST_VNI = 100000
+VXLAN_OVERHEAD = 50
 
 
 class DeployError(RuntimeError):
@@ -578,6 +579,47 @@ def ensure_zone(settings: Settings) -> None:
         log(f"zone {settings.zone} already present")
 
 
+def underlay_mtu(nodes: Sequence[Node]) -> int:
+    """Smallest MTU of the interfaces holding the nodes' cluster addresses (1500 if unknown)."""
+    mtus = []
+    for node in nodes:
+        if not node.address:
+            continue
+        script = f"dev=$(ip -o addr show to {shlex.quote(node.address)} | awk '{{print $2; exit}}'); " \
+            'if [ -n "$dev" ]; then cat "/sys/class/net/${dev%@*}/mtu"; fi'
+        output = node.run_script(script).strip()
+        if output.isdigit():
+            mtus.append(int(output))
+    return min(mtus, default=1500)
+
+
+def ensure_zone_mtu(settings: Settings, nodes: Sequence[Node], managed: int | None) -> int | None:
+    """Fit the vnet MTU to the VXLAN tunnels; return the MTU this script now manages.
+
+    Proxmox derives everything from the zone MTU: the vnet bridge, DHCP
+    option 26, the router advertisements, the LXC veths and the virtio NICs.
+    With CROSS_NODE=yes it is the underlay MTU minus the 50 bytes of VXLAN
+    (capped at 1500); an MTU set by the administrator is never touched.
+    """
+    path = f"/cluster/sdn/zones/{settings.zone}"
+    current = pvesh("get", path).get("mtu")
+    current = int(current) if current else None
+    if current is not None and current != managed:
+        return None  # set by the administrator
+    desired = min(1500, underlay_mtu(nodes) - VXLAN_OVERHEAD) if settings.cross_node else None
+    if desired == 1500:
+        desired = None  # the underlay carries full-size frames
+    if desired == current:
+        return desired
+    if desired is None:
+        log(f"zone {settings.zone}: removing MTU {current}")
+        pvesh("set", path, delete="mtu")
+    else:
+        log(f"zone {settings.zone}: MTU {desired} (underlay MTU minus {VXLAN_OVERHEAD} bytes of VXLAN)")
+        pvesh("set", path, mtu=desired)
+    return desired
+
+
 def ensure_vnet(settings: Settings) -> None:
     vnets = {entry["vnet"]: entry for entry in pvesh("get", "/cluster/sdn/vnets") or []}
     existing = vnets.get(settings.vnet)
@@ -746,7 +788,9 @@ echo "agent removed"
 """
 
 
-def write_shared_config(settings: Settings, subnet4: IPNetwork, subnet6: IPNetwork, vni: int | None) -> None:
+def write_shared_config(
+    settings: Settings, subnet4: IPNetwork, subnet6: IPNetwork, vni: int | None, zone_mtu: int | None
+) -> None:
     """Record the resolved settings in pmxcfs, where every node's agent reads them."""
     extra = " ".join(str(network) for network in settings.extra_blocked)
     timestamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
@@ -761,6 +805,7 @@ SUBNET4={subnet4}
 SUBNET6={subnet6}
 CROSS_NODE={'yes' if settings.cross_node else 'no'}
 VNI={vni or 'auto'}
+ZONE_MTU={zone_mtu or ''}
 ISOLATION={'yes' if settings.isolation else 'no'}
 SITE_PREFIX_LEN6={settings.site_prefix_len6}
 EXTRA_BLOCKED="{extra}"
@@ -804,10 +849,12 @@ def cmd_install(args: argparse.Namespace) -> None:
         print(node.run_script(DNSMASQ_SCRIPT).strip())
 
     ensure_zone(settings)
+    managed_mtu = (deployed or {}).get("ZONE_MTU", "")
+    zone_mtu = ensure_zone_mtu(settings, nodes, int(managed_mtu) if managed_mtu.isdigit() else None)
     ensure_vnet(settings)
     subnet4, subnet6 = ensure_subnets(settings, nodes)
     vni = settings.vni if settings.vni is not None or not settings.cross_node else free_vni()
-    write_shared_config(settings, subnet4, subnet6, vni)
+    write_shared_config(settings, subnet4, subnet6, vni, zone_mtu)
 
     for node in nodes:
         log(f"[{node.name}] installing {SERVICE_NAME}")
